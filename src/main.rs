@@ -1,5 +1,6 @@
 mod app;
 mod crypto;
+mod gpu;
 mod stats;
 mod ui;
 
@@ -14,6 +15,19 @@ use std::io;
 use std::time::Duration;
 
 fn main() -> anyhow::Result<()> {
+    // Redirect panic output to a log file so wgpu/driver panics in worker
+    // threads don't clobber the ratatui alternate screen.
+    std::panic::set_hook(Box::new(|info| {
+        use std::io::Write as _;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("ovds-panic.log")
+        {
+            let _ = writeln!(f, "{info}");
+        }
+    }));
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -96,6 +110,7 @@ fn handle_key(app: &mut App, code: KeyCode) {
                 KeyCode::Backspace | KeyCode::Delete => app.backspace(),
                 KeyCode::Left => app.cycle_match_type(false),
                 KeyCode::Right => app.cycle_match_type(true),
+                KeyCode::Up | KeyCode::Down => app.toggle_backend(),
                 KeyCode::Char(c) => app.type_char(c.to_ascii_lowercase()),
                 _ => {}
             },

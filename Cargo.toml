@@ -1,6 +1,6 @@
 [package]
 name = "ovds"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 
 [[bin]]
@@ -17,6 +17,9 @@ sha3 = "0.10"
 rayon = "1"
 data-encoding = "2"
 anyhow = "1.0.102"
+wgpu = "22"
+pollster = "0.3"
+bytemuck = { version = "1", features = ["derive"] }
 
 [profile.release]
 opt-level = 3

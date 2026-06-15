@@ -70,6 +70,28 @@ pub fn check_prefix_fast(pubkey: &[u8; 32], pattern: &[u8]) -> bool {
     enc[..n] == *pattern
 }
 
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Backend {
+    Cpu,
+    Gpu,
+}
+
+impl Backend {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Backend::Cpu => "CPU",
+            Backend::Gpu => "GPU",
+        }
+    }
+
+    pub fn toggle(&self) -> Self {
+        match self {
+            Backend::Cpu => Backend::Gpu,
+            Backend::Gpu => Backend::Cpu,
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Debug)]
 pub enum MatchType {
     Prefix,

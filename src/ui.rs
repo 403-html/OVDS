@@ -7,7 +7,7 @@ use ratatui::{
 };
 
 use crate::app::{App, FocusedPanel, Mode};
-use crate::crypto::{ADDRESS_LEN, validate_pattern};
+use crate::crypto::{ADDRESS_LEN, Backend, validate_pattern};
 use crate::stats::{
     cdf, expected_attempts, format_count, format_duration, format_rate, match_probability,
     quantile_attempts,
@@ -60,7 +60,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         ),
         Span::styled("  onion vanity domain search", Style::default().fg(DIM)),
         Span::styled(
-            format!("{:>width$}", "v0.1.0 ", width = area.width as usize - 32),
+            format!("{:>width$}", "v0.2.0 ", width = area.width as usize - 32),
             Style::default().fg(DIM),
         ),
     ]);
@@ -88,7 +88,7 @@ fn draw_body(f: &mut Frame, app: &App, area: Rect) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(8),  // pattern (full width)
+            Constraint::Length(9),  // search (full width)
             Constraint::Min(0),     // probability + time estimates
             Constraint::Length(10), // status / actions
         ])
@@ -117,7 +117,7 @@ fn draw_pattern_panel(f: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border_col))
         .title(Span::styled(
-            " PATTERN ",
+            " SEARCH ",
             Style::default().fg(title_col).add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(area);
@@ -205,6 +205,43 @@ fn draw_pattern_panel(f: &mut Frame, app: &App, area: Rect) {
         Line::from(spans)
     };
 
+    let backend_line = {
+        let options = [Backend::Cpu, Backend::Gpu];
+        let cur = app.backend;
+        let gpu_available = app.gpu.is_some();
+        let mut spans = vec![
+            Span::styled("  backend ", Style::default().fg(DIM)),
+            Span::styled("›  ", Style::default().fg(DIM)),
+        ];
+        for opt in options {
+            let unavailable = matches!(opt, Backend::Gpu) && !gpu_available;
+            if opt == cur {
+                let col = if unavailable { ERR } else { ACCENT };
+                spans.push(Span::styled(
+                    format!("[{}]", opt.label()),
+                    Style::default().fg(col).add_modifier(Modifier::BOLD),
+                ));
+            } else {
+                let col = if unavailable { ERR } else { DIM };
+                spans.push(Span::styled(
+                    format!(" {} ", opt.label()),
+                    Style::default().fg(col),
+                ));
+            }
+            spans.push(Span::raw(" "));
+        }
+        let detail = match (cur, &app.gpu) {
+            (Backend::Cpu, _) => format!("{} threads", app.threads),
+            (Backend::Gpu, Some(ctx)) => format!("{} · {}", ctx.backend_label(), ctx.adapter_name),
+            (Backend::Gpu, None) => "unavailable".into(),
+        };
+        spans.push(Span::styled(detail, Style::default().fg(DIM)));
+        if focused {
+            spans.push(Span::styled("   ↑ ↓", Style::default().fg(DIM)));
+        }
+        Line::from(spans)
+    };
+
     let preview_line = if !app.pattern.is_empty() && valid {
         let pat = &app.pattern;
         let remaining = ADDRESS_LEN.saturating_sub(pat.len());
@@ -245,6 +282,7 @@ fn draw_pattern_panel(f: &mut Frame, app: &App, area: Rect) {
         Line::from(input_spans),
         validity_line,
         match_line,
+        backend_line,
         preview_line,
     ]);
     f.render_widget(Paragraph::new(text), inner);
@@ -414,8 +452,8 @@ fn draw_time_panel(f: &mut Frame, app: &App, area: Rect) {
 
     let ref_rates: &[(&str, f64)] = &[("100K/s", 100_000.0), ("1M/s", 1_000_000.0)];
 
-    // Header: blank label col + one col per rate
-    let sep = "  ─────────────────────────────────────────────";
+    // Header: blank label col + ref columns + CPU + GPU
+    let sep = "  ─────────────────────────────────────────────────────────";
 
     let mut header_spans = vec![Span::styled(
         format!("  {:<5}", ""),
@@ -427,14 +465,38 @@ fn draw_time_panel(f: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(DIM),
         ));
     }
-    if let Some(rate) = app.benchmark_rate {
+    // CPU column
+    let cpu_active = matches!(app.backend, Backend::Cpu);
+    if let Some(rate) = app.cpu_benchmark_rate {
         header_spans.push(Span::styled(
-            format!("{:<11}", format_rate(rate)),
-            Style::default().fg(OK).add_modifier(Modifier::BOLD),
+            format!("CPU {:<7}", format_rate(rate)),
+            Style::default()
+                .fg(if cpu_active { OK } else { DIM })
+                .add_modifier(Modifier::BOLD),
         ));
     } else {
         header_spans.push(Span::styled(
-            "your hw  [b]",
+            "CPU [b]    ",
+            Style::default().fg(DIM).add_modifier(Modifier::ITALIC),
+        ));
+    }
+    // GPU column
+    let gpu_active = matches!(app.backend, Backend::Gpu);
+    if let Some(rate) = app.gpu_benchmark_rate {
+        header_spans.push(Span::styled(
+            format!("GPU {}", format_rate(rate)),
+            Style::default()
+                .fg(if gpu_active { OK } else { DIM })
+                .add_modifier(Modifier::BOLD),
+        ));
+    } else if app.gpu.is_some() {
+        header_spans.push(Span::styled(
+            "GPU [c,b]",
+            Style::default().fg(DIM).add_modifier(Modifier::ITALIC),
+        ));
+    } else {
+        header_spans.push(Span::styled(
+            "GPU n/a",
             Style::default().fg(DIM).add_modifier(Modifier::ITALIC),
         ));
     }
@@ -457,9 +519,28 @@ fn draw_time_panel(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(DIM),
             ));
         }
-        if let Some(rate) = app.benchmark_rate {
+        // CPU column
+        if let Some(rate) = app.cpu_benchmark_rate {
             let secs = quantile_attempts(p, *q) / rate;
-            spans.push(Span::styled(format_duration(secs), Style::default().fg(OK)));
+            spans.push(Span::styled(
+                format!("{:<11}", format_duration(secs)),
+                Style::default().fg(if cpu_active { OK } else { DIM }),
+            ));
+        } else {
+            spans.push(Span::styled(
+                format!("{:<11}", "-"),
+                Style::default().fg(DIM),
+            ));
+        }
+        // GPU column
+        if let Some(rate) = app.gpu_benchmark_rate {
+            let secs = quantile_attempts(p, *q) / rate;
+            spans.push(Span::styled(
+                format_duration(secs),
+                Style::default().fg(if gpu_active { OK } else { DIM }),
+            ));
+        } else {
+            spans.push(Span::styled("-", Style::default().fg(DIM)));
         }
         lines.push(Line::from(spans));
     }
@@ -473,9 +554,11 @@ fn draw_status_panel(f: &mut Frame, app: &App, area: Rect) {
     match &app.mode {
         Mode::Idle => draw_idle_status(f, app, area),
         Mode::Error(msg) => draw_error(f, area, msg),
-        Mode::Benchmarking { started, worker } => {
-            draw_benchmark_status(f, area, *started, worker.attempts())
-        }
+        Mode::Benchmarking {
+            started,
+            worker,
+            backend,
+        } => draw_benchmark_status(f, area, *started, worker.attempts(), *backend),
         Mode::Generating {
             started,
             worker,
@@ -538,7 +621,10 @@ fn draw_idle_status(f: &mut Frame, app: &App, area: Rect) {
             Span::styled("[b]", key_style),
             Span::raw("  "),
             Span::styled("benchmark  ", Style::default().fg(BRIGHT)),
-            Span::styled("measure keys/s on your hardware", Style::default().fg(DIM)),
+            Span::styled(
+                format!("measure {} throughput", app.backend.label()),
+                Style::default().fg(DIM),
+            ),
         ]),
     ];
 
@@ -560,12 +646,22 @@ fn draw_idle_status(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
-fn draw_benchmark_status(f: &mut Frame, area: Rect, started: std::time::Instant, attempts: u64) {
+fn draw_benchmark_status(
+    f: &mut Frame,
+    area: Rect,
+    started: std::time::Instant,
+    attempts: u64,
+    backend: Backend,
+) {
+    let title = match backend {
+        Backend::Cpu => " BENCHMARKING · CPU ",
+        Backend::Gpu => " BENCHMARKING · GPU ",
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(ACCENT))
         .title(Span::styled(
-            " BENCHMARKING ",
+            title,
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(area);
@@ -587,11 +683,16 @@ fn draw_benchmark_status(f: &mut Frame, area: Rect, started: std::time::Instant,
         height: 1,
     };
 
+    let unit = match backend {
+        Backend::Cpu => "keys/s",
+        Backend::Gpu => "SHA-256/s",
+    };
     let label = format!(
-        " {:.0}s / {:.0}s  |  {} keys/s ",
+        " {:.0}s / {:.0}s  |  {} {} ",
         elapsed.min(total),
         total,
-        format_count(rate)
+        format_count(rate),
+        unit
     );
 
     f.render_widget(
@@ -602,13 +703,17 @@ fn draw_benchmark_status(f: &mut Frame, area: Rect, started: std::time::Instant,
         gauge_area,
     );
 
+    let work_label = match backend {
+        Backend::Cpu => "keypairs generated",
+        Backend::Gpu => "SHA-256 ops dispatched",
+    };
     f.render_widget(
         Paragraph::new(Text::from(vec![
             Line::raw(""),
             Line::raw(""),
             Line::raw(""),
             Line::from(Span::styled(
-                format!("  {} keypairs generated", format_count(attempts as f64)),
+                format!("  {} {}", format_count(attempts as f64), work_label),
                 Style::default().fg(DIM),
             )),
         ])),
@@ -816,10 +921,11 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         Mode::Error(_) => "  [Esc] dismiss  │  [q] quit".to_string(),
         Mode::Idle => match &app.focused_panel {
             FocusedPanel::Pattern => {
-                "  type a–z 2–7  │  [← →] match type  │  [Tab] → actions  │  [q] quit".to_string()
+                "  type a–z 2–7  │  [← →] match  │  [↑ ↓] backend  │  [Tab] → actions  │  [q] quit"
+                    .to_string()
             }
             FocusedPanel::Actions => {
-                "  [g] generate  │  [b] benchmark  │  [Tab] → pattern  │  [q] quit".to_string()
+                "  [g] generate  │  [b] benchmark  │  [Tab] → search  │  [q] quit".to_string()
             }
         },
     };

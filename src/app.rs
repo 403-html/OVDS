@@ -4,13 +4,15 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::crypto::MatchType;
+use crate::crypto::{Backend, MatchType};
+use crate::gpu::GpuContext;
 
 #[derive(Clone)]
 pub struct WorkerState {
     pub attempts: Arc<AtomicU64>,
     pub stop: Arc<AtomicBool>,
     pub result: Arc<Mutex<Option<FoundResult>>>,
+    pub error: Arc<Mutex<Option<String>>>,
 }
 
 impl WorkerState {
@@ -19,6 +21,7 @@ impl WorkerState {
             attempts: Arc::new(AtomicU64::new(0)),
             stop: Arc::new(AtomicBool::new(false)),
             result: Arc::new(Mutex::new(None)),
+            error: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -42,6 +45,7 @@ pub enum Mode {
     Benchmarking {
         started: Instant,
         worker: WorkerState,
+        backend: Backend,
     },
     Generating {
         started: Instant,
@@ -121,8 +125,12 @@ pub struct App {
     pub pattern: String,
     pub match_type: MatchType,
     pub mode: Mode,
-    pub benchmark_rate: Option<f64>,
+    pub cpu_benchmark_rate: Option<f64>,
+    pub gpu_benchmark_rate: Option<f64>,
     pub threads: usize,
+    pub backend: Backend,
+    pub gpu: Option<Arc<GpuContext>>,
+    pub gpu_init_error: Option<String>,
     pub status_msg: String,
     pub focused_panel: FocusedPanel,
     pub quit: bool,
@@ -130,16 +138,42 @@ pub struct App {
 
 impl App {
     pub fn new() -> Self {
+        let (gpu, gpu_init_error) = match GpuContext::init() {
+            Ok(ctx) => (Some(Arc::new(ctx)), None),
+            Err(e) => (None, Some(e.to_string())),
+        };
         Self {
             pattern: String::new(),
             match_type: MatchType::Prefix,
             mode: Mode::Idle,
-            benchmark_rate: None,
+            cpu_benchmark_rate: None,
+            gpu_benchmark_rate: None,
             threads: rayon::current_num_threads(),
+            backend: Backend::Cpu,
+            gpu,
+            gpu_init_error,
             status_msg: String::new(),
             focused_panel: FocusedPanel::Pattern,
             quit: false,
         }
+    }
+
+    pub fn toggle_backend(&mut self) {
+        self.backend = self.backend.toggle();
+        self.status_msg = match (self.backend, &self.gpu) {
+            (Backend::Gpu, None) => format!(
+                "GPU unavailable: {}",
+                self.gpu_init_error
+                    .clone()
+                    .unwrap_or_else(|| "no adapter".into())
+            ),
+            (Backend::Gpu, Some(ctx)) => format!(
+                "Backend: GPU ({} · {})",
+                ctx.backend_label(),
+                ctx.adapter_name
+            ),
+            (Backend::Cpu, _) => format!("Backend: CPU ({} threads)", self.threads),
+        };
     }
 
     pub fn cycle_panel(&mut self) {
@@ -175,6 +209,13 @@ impl App {
     }
 
     pub fn start_benchmark(&mut self) {
+        match self.backend {
+            Backend::Cpu => self.start_benchmark_cpu(),
+            Backend::Gpu => self.start_benchmark_gpu(),
+        }
+    }
+
+    fn start_benchmark_cpu(&mut self) {
         let worker = WorkerState::new();
         let w = worker.clone();
 
@@ -192,7 +233,6 @@ impl App {
                         }
                     });
                 });
-                // stop after 5 seconds
                 std::thread::sleep(Duration::from_secs(5));
                 w.stop();
             });
@@ -201,14 +241,66 @@ impl App {
         self.mode = Mode::Benchmarking {
             started: Instant::now(),
             worker,
+            backend: Backend::Cpu,
         };
-        self.status_msg = "Benchmarking key generation speed...".into();
+        self.status_msg = "Benchmarking CPU key generation...".into();
+    }
+
+    fn start_benchmark_gpu(&mut self) {
+        let Some(gpu) = self.gpu.clone() else {
+            self.status_msg = format!(
+                "GPU unavailable: {}",
+                self.gpu_init_error
+                    .clone()
+                    .unwrap_or_else(|| "no adapter".into())
+            );
+            return;
+        };
+
+        let status_label = format!(
+            "Benchmarking GPU ({} · {}) - iterated SHA-256...",
+            gpu.backend_label(),
+            gpu.adapter_name
+        );
+
+        let worker = WorkerState::new();
+        let w = worker.clone();
+        let gpu_thread = Arc::clone(&gpu);
+
+        std::thread::spawn(move || {
+            let attempts = Arc::clone(&w.attempts);
+            let stop = Arc::clone(&w.stop);
+            let error = Arc::clone(&w.error);
+            // Isolate any wgpu panic (e.g. shader validation) from the TUI.
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                crate::gpu::run_bench(&gpu_thread, attempts, stop, 5.0)
+            }));
+            match res {
+                Ok(Err(e)) => *error.lock().unwrap() = Some(format!("GPU error: {e}")),
+                Err(_) => *error.lock().unwrap() = Some("GPU panicked (see ovds-panic.log)".into()),
+                Ok(Ok(())) => {}
+            }
+            w.stop();
+        });
+
+        self.mode = Mode::Benchmarking {
+            started: Instant::now(),
+            worker,
+            backend: Backend::Gpu,
+        };
+        self.status_msg = status_label;
     }
 
     pub fn start_generate(&mut self) {
         if !self.pattern_valid() {
             self.status_msg = "Invalid pattern - use a-z and 2-7 only".into();
             return;
+        }
+
+        // v0.2.0: full ed25519 scalar mult on GPU is forthcoming; for now the
+        // GPU backend selection still runs CPU keygen with a clear status.
+        if matches!(self.backend, Backend::Gpu) {
+            self.status_msg = "GPU keygen pending (v0.3.0); using CPU keygen this run".into();
         }
 
         let worker = WorkerState::new();
@@ -314,17 +406,35 @@ impl App {
     /// Poll worker state - call each tick.
     pub fn tick(&mut self) {
         match &mut self.mode {
-            Mode::Benchmarking { started, worker } => {
+            Mode::Benchmarking {
+                started,
+                worker,
+                backend,
+            } => {
                 let elapsed = started.elapsed();
                 if worker.stop.load(Ordering::Relaxed) || elapsed >= Duration::from_secs(6) {
                     let attempts = worker.attempts();
                     let secs = elapsed.as_secs_f64().max(0.1);
-                    self.benchmark_rate = Some(attempts as f64 / secs);
-                    self.status_msg = format!(
-                        "Benchmark done: {:.0} keys/s on {} threads",
-                        self.benchmark_rate.unwrap(),
-                        self.threads
-                    );
+                    let rate = attempts as f64 / secs;
+                    let err = worker.error.lock().unwrap().clone();
+                    match backend {
+                        Backend::Cpu => {
+                            self.cpu_benchmark_rate = Some(rate);
+                            self.status_msg = format!(
+                                "CPU benchmark done: {:.0} keys/s on {} threads",
+                                rate, self.threads
+                            );
+                        }
+                        Backend::Gpu => {
+                            if let Some(e) = err {
+                                self.status_msg = e;
+                            } else {
+                                self.gpu_benchmark_rate = Some(rate);
+                                self.status_msg =
+                                    format!("GPU benchmark done: {:.0} SHA-256/s", rate);
+                            }
+                        }
+                    }
                     self.mode = Mode::Idle;
                 }
             }
