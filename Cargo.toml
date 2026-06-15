@@ -1,0 +1,24 @@
+[package]
+name = "ovds"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "ovds"
+path = "src/main.rs"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
+sha2 = "0.10"
+sha3 = "0.10"
+rayon = "1"
+data-encoding = "2"
+anyhow = "1.0.102"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
