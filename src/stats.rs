@@ -106,7 +106,7 @@ pub fn format_rate(kps: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::MatchType;
+    use crate::crypto::{ADDRESS_LEN, MatchType};
 
     #[test]
     fn quantile_no_underflow_for_long_patterns() {
@@ -140,5 +140,73 @@ mod tests {
             "CDF at median should be ~0.5, got {}",
             c
         );
+    }
+
+    #[test]
+    fn format_duration_branches() {
+        assert_eq!(format_duration(0.123), "123ms");
+        assert_eq!(format_duration(5.0), "5s");
+        assert_eq!(format_duration(125.0), "2m 5s");
+        assert_eq!(format_duration(3700.0), "1h 1m");
+        assert_eq!(format_duration(90_000.0), "1d 1h");
+        let years = format_duration(86400.0 * 365.25 * 2.5);
+        assert!(years.ends_with("yr"), "expected yr suffix, got {years}");
+        let huge = format_duration(86400.0 * 365.25 * 1e6);
+        assert!(
+            huge.contains('e'),
+            "expected scientific notation, got {huge}"
+        );
+        assert_eq!(format_duration(f64::INFINITY), "\u{221e}");
+    }
+
+    #[test]
+    fn format_count_branches() {
+        assert_eq!(format_count(7.0), "7");
+        assert_eq!(format_count(1_500.0), "1.5K");
+        assert_eq!(format_count(2_500_000.0), "2.5M");
+        assert_eq!(format_count(1.2e9), "1.2B");
+        assert_eq!(format_count(3.4e12), "3.4T");
+        assert_eq!(format_count(5.6e15), "5.6P");
+        assert!(format_count(1.0e20).contains('e'));
+    }
+
+    #[test]
+    fn expected_attempts_edge_cases() {
+        assert_eq!(expected_attempts(0.0), f64::INFINITY);
+        assert_eq!(expected_attempts(-1.0), f64::INFINITY);
+        assert!((expected_attempts(0.25) - 4.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn match_probability_scales_with_length() {
+        let p3 = match_probability(3, &MatchType::Prefix);
+        let p4 = match_probability(4, &MatchType::Prefix);
+        // each char divides probability by 32
+        assert!((p3 / p4 - 32.0).abs() < 1e-12);
+        assert_eq!(match_probability(0, &MatchType::Prefix), 1.0);
+    }
+
+    #[test]
+    fn match_probability_anywhere_uses_positions() {
+        // anywhere uses (positions * p_single), capped at 1.0
+        let p_single = match_probability(3, &MatchType::Prefix);
+        let p_any = match_probability(3, &MatchType::Anywhere);
+        let positions = ADDRESS_LEN - 3 + 1;
+        assert!((p_any - (positions as f64 * p_single)).abs() < 1e-15);
+        // very short pattern saturates to 1.0
+        assert_eq!(match_probability(0, &MatchType::Anywhere), 1.0);
+    }
+
+    #[test]
+    fn quantile_monotone_in_q() {
+        let p = 1.0 / 1024.0;
+        let q50 = quantile_attempts(p, 0.50);
+        let q95 = quantile_attempts(p, 0.95);
+        assert!(q95 > q50, "p95 must be larger than p50 ({q50} vs {q95})");
+    }
+
+    #[test]
+    fn format_rate_has_per_second() {
+        assert!(format_rate(1.5e6).ends_with("/s"));
     }
 }
