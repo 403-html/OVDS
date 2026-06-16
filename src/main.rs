@@ -1,5 +1,7 @@
 mod app;
 mod crypto;
+#[cfg(test)]
+mod fe16_ref;
 mod gpu;
 mod stats;
 mod ui;
