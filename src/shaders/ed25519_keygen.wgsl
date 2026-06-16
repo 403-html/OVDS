@@ -18,8 +18,8 @@
 //   [0..8]    base_seed (8 LE u32)
 //   [8]       batch_id
 //   [9]       threads
-//   [10]      mode (0 = on-device prefix match + compaction, 1 = write-all by index)
-//   [11]      pattern_len (base32 chars, prefix mode only)
+//   [10]      mode (0 = prefix compaction, 1 = write-all incremental, 2 = anywhere compaction)
+//   [11]      pattern_len (base32 chars; prefix and anywhere modes)
 //   [12..28]  bX (16 limbs)
 //   [28..44]  bY
 //   [44..60]  bZ
@@ -31,7 +31,7 @@
 @group(0) @binding(1) var<storage, read_write> table: array<u32>;
 // Output buffer (atomic so prefix mode can compact matches via atomicAdd):
 //   mode 0 (prefix): [0] = match count, records start at OUT_HEADER, 16 u32 each
-//   mode 1 (write-all): record i at i*16, 8 u32 pubkey + 8 u32 scalar
+//   mode 1 (write-all): candidate flat index i at i*16, 8 u32 pubkey + 8 u32 scalar
 @group(0) @binding(2) var<storage, read_write> output: array<atomic<u32>>;
 // Scratch for incremental batch generation: per candidate 4 field elements
 // (X, Y, Z, running-prefix-product), 16 limbs each = 64 u32.
@@ -45,6 +45,9 @@ const COMB_PTS_PER_WIN: u32 = 256u; // 1 << COMB_W
 const GE_WORDS: u32 = 64u;         // 4 field elements * 16 limbs
 const OUT_HEADER: u32 = 4u;
 const MAX_MATCHES: u32 = 256u;
+// Char j reads pubkey bytes 5j/8 and 5j/8+1, so j <= 47 keeps both within the
+// 32-byte pubkey. The anywhere matcher slides over chars 0..47 (no checksum).
+const MAX_DEVICE_PREFIX: u32 = 48u;
 
 // Incremental batch: each thread computes P0 = s0*B once (comb), then walks
 // P0, P0+B, P0+2B, ... emitting BATCH_K candidates. Each step is one projective
@@ -478,6 +481,23 @@ fn matches_prefix(pk: array<u32, 8>, plen: u32) -> bool {
     return true;
 }
 
+// Slide the pattern over the pubkey-derived chars (0..47, which encode straight
+// from pubkey bytes with no checksum). Tail positions that would touch the
+// checksum/version bytes are not checked on-device; the host re-verifies every
+// emitted match, and for random pubkeys a pubkey-region hit is overwhelmingly
+// more likely than a tail-only one, so the search still converges quickly.
+fn matches_anywhere(pk: array<u32, 8>, plen: u32) -> bool {
+    let last_start = MAX_DEVICE_PREFIX - plen;
+    for (var p = 0u; p <= last_start; p = p + 1u) {
+        var ok = true;
+        for (var k = 0u; k < plen; k = k + 1u) {
+            if (base32_sym(pk, p + k) != params[76u + k]) { ok = false; break; }
+        }
+        if (ok) { return true; }
+    }
+    return false;
+}
+
 fn write_record(o: u32, pubkey: array<u32, 8>, scalar: array<u32, 8>) {
     var pk = pubkey;
     var sc = scalar;
@@ -553,19 +573,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let base_seed = load_base_seed();
     let batch_id = params[8u];
     let mode = params[10u];
-    var s0 = derive_scalar(base_seed, batch_id, idx);
-
-    // Write-all mode: one full keypair per thread (the dalek regression path).
-    if (mode == 1u) {
-        let Q = comb_scalarmult(s0);
-        let pubkey = ge_compress(Q);
-        write_record(idx * 16u, pubkey, s0);
-        return;
-    }
-
-    // Prefix mode: incremental generation + batched inversion.
     let plen = params[11u];
+    var s0 = derive_scalar(base_seed, batch_id, idx);
     let B = load_basepoint();
+
+    // Every mode shares one incremental batch: P0 = s0*B once (comb), then walk
+    // P0, P0+B, P0+2B, ... emitting BATCH_K candidates. Each step is one
+    // projective add; the per-candidate inversions are batched into one
+    // (Montgomery's trick). Prefix/anywhere match on-device and compact; write-all
+    // emits every candidate keypair for the host to scan.
     var P = comb_scalarmult(s0); // P0 = s0 * B (projective)
     let sbase = idx * BATCH_K * SCRATCH_WORDS_PER;
 
@@ -594,10 +610,22 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let zinv = fe_mul(inv, pre);
         inv = fe_mul(inv, zj);
         let pubkey = compress_zinv(scratch_load_fe(o), scratch_load_fe(o + 16u), zinv);
-        if (matches_prefix(pubkey, plen)) {
-            let slot = atomicAdd(&output[0u], 1u);
-            if (slot < MAX_MATCHES) {
-                write_record(OUT_HEADER + slot * 16u, pubkey, scalar_add_u32(s0, j));
+
+        if (mode == 1u) {
+            // Write-all: emit every candidate keypair by flat index; host scans.
+            write_record((idx * BATCH_K + j) * 16u, pubkey, scalar_add_u32(s0, j));
+        } else {
+            var hit = false;
+            if (mode == 2u) {
+                hit = matches_anywhere(pubkey, plen);
+            } else {
+                hit = matches_prefix(pubkey, plen);
+            }
+            if (hit) {
+                let slot = atomicAdd(&output[0u], 1u);
+                if (slot < MAX_MATCHES) {
+                    write_record(OUT_HEADER + slot * 16u, pubkey, scalar_add_u32(s0, j));
+                }
             }
         }
     }

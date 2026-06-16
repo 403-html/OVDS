@@ -60,7 +60,11 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         ),
         Span::styled("  onion vanity domain search", Style::default().fg(DIM)),
         Span::styled(
-            format!("{:>width$}", "v0.3.0 ", width = area.width as usize - 32),
+            format!(
+                "{:>width$}",
+                concat!("v", env!("CARGO_PKG_VERSION"), " "),
+                width = area.width as usize - 32
+            ),
             Style::default().fg(DIM),
         ),
     ]);

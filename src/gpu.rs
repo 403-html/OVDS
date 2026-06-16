@@ -2,10 +2,11 @@
 //!
 //! Ships the ed25519 keygen pipeline (KeygenPipeline) plus a benchmark
 //! (run_keygen_bench) that measures real key-generation throughput on the same
-//! kernel. For prefix search the keygen kernel uses
-//! incremental generation with batched inversion (one point add per candidate,
-//! amortized) and matches prefixes on-device, returning only the matches.
-//! Suffix/anywhere fall back to a write-all kernel scanned on the host.
+//! kernel. Every mode uses incremental generation with batched inversion (one
+//! point add per candidate, amortized). Prefix and anywhere patterns match
+//! on-device and return only the matches (tiny readback). Suffix (and patterns
+//! too long for the on-device matcher) use the same incremental kernel in
+//! write-all mode and are scanned on the host in parallel with Rayon.
 //!
 //! Targets:
 //!   - Metal on macOS
@@ -88,7 +89,7 @@ impl GpuContext {
 }
 
 // ============================================================================
-// Ed25519 GPU keygen (v0.3.0)
+// Ed25519 GPU keygen
 // ============================================================================
 
 const KEYGEN_SHADER: &str = include_str!("shaders/ed25519_keygen.wgsl");
@@ -191,7 +192,8 @@ fn bytes_to_fe16(b: &[u8; 32]) -> [u32; 16] {
 
 /// Dispatch modes (must match the `mode` param in ed25519_keygen.wgsl).
 const MODE_PREFIX: u32 = 0; // on-device prefix match + atomic compaction
-const MODE_WRITE_ALL: u32 = 1; // every thread writes its keypair by index
+const MODE_WRITE_ALL: u32 = 1; // incremental, every candidate written by flat index
+const MODE_ANYWHERE: u32 = 2; // on-device anywhere match + atomic compaction
 
 const KEYGEN_THREADS: u32 = 16_384;
 const KEYGEN_WORKGROUP_SIZE: u32 = 64;
@@ -301,9 +303,10 @@ impl KeygenPipeline {
             usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
-        // Sized for write-all mode (the largest layout); prefix mode uses only
-        // the small header + matches region at the front.
-        let output_size = (KEYGEN_THREADS as u64) * 16 * 4;
+        // Sized for write-all mode (the largest layout): every candidate
+        // (threads * BATCH_K) writes a 16-u32 record. Compaction modes use only
+        // the small header + matches region at the front of the same buffer.
+        let output_size = (KEYGEN_THREADS as u64) * (BATCH_K as u64) * 16 * 4;
         let output_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("keygen-output"),
             size: output_size,
@@ -425,19 +428,20 @@ fn keygen_dispatch(
     }
     params[8] = batch_id;
     params[10] = mode;
-    if mode == MODE_PREFIX {
+    let compaction = mode != MODE_WRITE_ALL;
+    if compaction {
         params[11] = pattern_syms.len() as u32;
         params[76..76 + pattern_syms.len()].copy_from_slice(pattern_syms);
     }
     ctx.queue
         .write_buffer(&pipe.params_buf, 0, bytemuck::cast_slice(&params));
-    // Reset the match counter before each prefix batch.
-    if mode == MODE_PREFIX {
+    // Reset the match counter before each compaction batch.
+    if compaction {
         ctx.queue.write_buffer(&pipe.output_buf, 0, &[0u8; 4]);
     }
 
     // Only read back what each mode produces.
-    let copy_size: u64 = if mode == MODE_PREFIX {
+    let copy_size: u64 = if compaction {
         ((OUT_HEADER + MAX_MATCHES * 16) * 4) as u64
     } else {
         pipe.output_size
@@ -472,13 +476,13 @@ fn keygen_dispatch(
     let raw = slice.get_mapped_range();
     let words: &[u32] = bytemuck::cast_slice(&raw);
 
-    let pairs = if mode == MODE_PREFIX {
+    let pairs = if compaction {
         let count = (words[0] as usize).min(MAX_MATCHES);
         (0..count)
             .map(|i| parse_pair(words, OUT_HEADER + i * 16))
             .collect()
     } else {
-        (0..pipe.threads as usize)
+        (0..pipe.threads as usize * BATCH_K as usize)
             .map(|i| parse_pair(words, i * 16))
             .collect()
     };
@@ -501,23 +505,33 @@ pub fn run_keygen(
 ) -> Result<()> {
     use crate::crypto::{MatchType, address_from_pubkey, check_prefix_fast};
     use rand::RngCore;
+    use rayon::prelude::*;
 
-    // Decide the dispatch mode once: on-device prefix matching when the pattern
-    // is a short enough prefix, otherwise write-all + host scan.
-    let device_prefix = matches!(match_type, MatchType::Prefix)
-        && pattern.len() <= MAX_DEVICE_PREFIX
-        && pattern_to_symbols(&pattern).is_some();
-    let (mode, pattern_syms) = if device_prefix {
-        (MODE_PREFIX, pattern_to_symbols(&pattern).unwrap())
-    } else {
-        (MODE_WRITE_ALL, Vec::new())
+    // Decide the dispatch mode once. Prefix and anywhere patterns short enough for
+    // the on-device matcher compact their hits on the device (tiny readback).
+    // Everything else (suffix, or over-long patterns) uses the same incremental
+    // kernel in write-all mode and is scanned on the host.
+    let device_ok = pattern.len() <= MAX_DEVICE_PREFIX && pattern_to_symbols(&pattern).is_some();
+    let (mode, pattern_syms) = match match_type {
+        MatchType::Prefix if device_ok => (MODE_PREFIX, pattern_to_symbols(&pattern).unwrap()),
+        MatchType::Anywhere if device_ok => (MODE_ANYWHERE, pattern_to_symbols(&pattern).unwrap()),
+        _ => (MODE_WRITE_ALL, Vec::new()),
     };
 
-    // Candidates produced per dispatch: prefix mode walks BATCH_K per thread.
-    let per_dispatch = if mode == MODE_PREFIX {
-        pipe.threads as u64 * BATCH_K as u64
-    } else {
-        pipe.threads as u64
+    // Every mode walks BATCH_K candidates per thread now.
+    let per_dispatch = pipe.threads as u64 * BATCH_K as u64;
+
+    // Host re-verification against the full address. Device-matched candidates are
+    // double-checked; write-all candidates are scanned here.
+    let host_match = |kp: &GpuKeyPair| -> bool {
+        match match_type {
+            MatchType::Prefix => check_prefix_fast(&kp.pubkey, &pattern),
+            MatchType::Suffix => address_from_pubkey(&kp.pubkey).ends_with(pattern.as_slice()),
+            MatchType::Anywhere => {
+                let addr = address_from_pubkey(&kp.pubkey);
+                addr.windows(pattern.len()).any(|w| w == pattern.as_slice())
+            }
+        }
     };
 
     let mut rng = rand::thread_rng();
@@ -527,25 +541,17 @@ pub fn run_keygen(
         rng.fill_bytes(&mut base_seed);
         let pairs = keygen_dispatch(ctx, pipe, &base_seed, batch_id, mode, &pattern_syms)?;
         attempts.fetch_add(per_dispatch, Ordering::Relaxed);
-        for kp in &pairs {
-            // Re-verify on the host (device prefix candidates are double-checked;
-            // write-all pairs are scanned here).
-            let matched = match match_type {
-                MatchType::Prefix => check_prefix_fast(&kp.pubkey, &pattern),
-                MatchType::Suffix => {
-                    let addr = address_from_pubkey(&kp.pubkey);
-                    addr.ends_with(pattern.as_slice())
-                }
-                MatchType::Anywhere => {
-                    let addr = address_from_pubkey(&kp.pubkey);
-                    addr.windows(pattern.len()).any(|w| w == pattern.as_slice())
-                }
-            };
-            if matched {
-                *result.lock().unwrap() = Some(*kp);
-                stop.store(true, Ordering::Relaxed);
-                return Ok(());
-            }
+        // Write-all returns ~1M candidates to scan (full SHA3 per key), so fan it
+        // out across cores; compaction modes return only a handful of hits.
+        let hit = if mode == MODE_WRITE_ALL {
+            pairs.par_iter().find_any(|kp| host_match(kp)).copied()
+        } else {
+            pairs.iter().find(|kp| host_match(kp)).copied()
+        };
+        if let Some(kp) = hit {
+            *result.lock().unwrap() = Some(kp);
+            stop.store(true, Ordering::Relaxed);
+            return Ok(());
         }
         batch_id = batch_id.wrapping_add(1);
     }
@@ -610,6 +616,18 @@ mod tests {
         out
     }
 
+    /// Mirror of the WGSL `scalar_add_u32`: add a small integer to a 256-bit LE
+    /// scalar with carry propagation.
+    fn scalar_add_host(mut s: [u8; 32], j: u32) -> [u8; 32] {
+        let mut carry = j as u64;
+        for byte in s.iter_mut() {
+            let v = *byte as u64 + (carry & 0xFF);
+            *byte = v as u8;
+            carry = (carry >> 8) + (v >> 8);
+        }
+        s
+    }
+
     /// Full-pipeline validation: for each GPU thread, the device-computed pubkey
     /// must equal curve25519-dalek's scalar*B for the GPU's own clamped scalar.
     /// This is the regression guard for the entire WGSL ed25519 implementation.
@@ -623,21 +641,70 @@ mod tests {
             return;
         };
         let pipe = KeygenPipeline::new(&ctx).expect("pipeline init");
-        // Exercise a couple of batches/seeds so we cover varied scalars.
+        // Exercise a couple of batches/seeds so we cover varied scalars. Write-all
+        // now returns every incremental candidate (threads * BATCH_K): flat index
+        // i maps to thread = i / BATCH_K, step j = i % BATCH_K, and the candidate
+        // scalar is s0(thread) + j. Sampling across the flat range covers both the
+        // comb start point (j == 0) and the incremental adds (j > 0).
         for (base_seed, batch_id) in [([0u8; 32], 0u32), ([0x5Au8; 32], 7u32)] {
             let pairs = keygen_dispatch(&ctx, &pipe, &base_seed, batch_id, MODE_WRITE_ALL, &[])
                 .expect("dispatch");
-            for (i, kp) in pairs.iter().enumerate().step_by(101) {
-                let expected_scalar = derive_scalar_host(&base_seed, batch_id, i as u32);
-                assert_eq!(kp.scalar, expected_scalar, "thread {i}: scalar mismatch");
+            for (i, kp) in pairs.iter().enumerate().step_by(1009) {
+                let thread = i as u32 / BATCH_K;
+                let j = i as u32 % BATCH_K;
+                let s0 = derive_scalar_host(&base_seed, batch_id, thread);
+                let expected_scalar = scalar_add_host(s0, j);
+                assert_eq!(kp.scalar, expected_scalar, "candidate {i}: scalar mismatch");
                 let s = Scalar::from_bytes_mod_order(expected_scalar);
                 let expected_pub = EdwardsPoint::mul_base(&s).compress().0;
                 assert_eq!(
                     kp.pubkey, expected_pub,
-                    "thread {i}: GPU pubkey != dalek scalar*B"
+                    "candidate {i}: GPU pubkey != dalek scalar*B"
                 );
             }
         }
+    }
+
+    /// End-to-end: the GPU search loop must find a short anywhere pattern via the
+    /// on-device anywhere matcher, and the matched address must actually contain
+    /// the pattern (and the recovered scalar must reproduce the pubkey).
+    #[test]
+    fn gpu_search_finds_anywhere() {
+        use crate::crypto::{MatchType, address_from_pubkey};
+        use curve25519_dalek::{edwards::EdwardsPoint, scalar::Scalar};
+
+        let Ok(ctx) = GpuContext::init() else {
+            eprintln!("skipping GPU test: no adapter");
+            return;
+        };
+        let pipe = KeygenPipeline::new(&ctx).expect("pipeline init");
+        let pattern = b"aa".to_vec(); // 2 chars: found within the first batch
+        let attempts = Arc::new(AtomicU64::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let result = Arc::new(Mutex::new(None));
+        run_keygen(
+            &ctx,
+            &pipe,
+            pattern.clone(),
+            MatchType::Anywhere,
+            attempts,
+            stop,
+            Arc::clone(&result),
+        )
+        .expect("keygen run");
+        let kp = result.lock().unwrap().take().expect("should find a match");
+        let addr = address_from_pubkey(&kp.pubkey);
+        assert!(
+            addr.windows(pattern.len()).any(|w| w == pattern.as_slice()),
+            "matched address {:?} does not contain pattern",
+            std::str::from_utf8(&addr).unwrap()
+        );
+        let s = Scalar::from_bytes_mod_order(kp.scalar);
+        assert_eq!(
+            EdwardsPoint::mul_base(&s).compress().0,
+            kp.pubkey,
+            "recovered scalar*B != matched pubkey"
+        );
     }
 
     /// End-to-end: the GPU search loop must find a short prefix and the matched
