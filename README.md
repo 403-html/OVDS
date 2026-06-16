@@ -3,7 +3,7 @@
 Generate a custom `.onion` address for your Tor hidden service. Type a word, pick prefix/suffix/anywhere, and `ovds` searches all CPU cores until it finds a matching Ed25519 keypair.
 
 ```
- OVDS  onion vanity domain search                                      v0.2.0
+ OVDS  onion vanity domain search                                      v0.3.0
  mode  ›  estimate
 ┌ SEARCH ───────────────────────────────────────────────────────────────────────┐
 │                                                                               │
@@ -20,7 +20,7 @@ Generate a custom `.onion` address for your Tor hidden service. Type a word, pic
 
 - Prefix, suffix, or anywhere matching
 - CPU backend: all cores via Rayon, prefix fast-path skips SHA3-256 (~2x faster)
-- GPU backend (v0.2.0): wgpu-based compute, cross-platform (Metal on macOS, Vulkan on Linux, DX12 on Windows)
+- GPU backend (v0.3.0): real ed25519 keygen on the device via wgpu compute, cross-platform (Metal on macOS, Vulkan on Linux, DX12 on Windows)
 - Live throughput sparkline, ETA at p50/p95, probabilistic progress gauge
 - Side-by-side CPU vs GPU benchmark columns in the time estimates panel
 - Saves in Tor's native format, ready to drop into `HiddenServiceDir`
@@ -32,9 +32,11 @@ Toggle between CPU and GPU from the SEARCH panel with `↑ ↓`. Run `[b]` to be
 | Backend | Status | Notes |
 |---------|--------|-------|
 | CPU     | full   | ed25519 keygen + SHA3 + base32 on all cores |
-| GPU     | benchmark + estimates | wgpu compute pipeline (Metal / Vulkan / DX12); benchmark measures iterated SHA-256 throughput |
+| GPU     | full   | ed25519 scalar multiplication on the device (Metal / Vulkan / DX12); host scans the resulting pubkeys against the pattern |
 
-> GPU keypair generation (ed25519 scalar multiplication on the device) is on the roadmap for v0.3.0. In v0.2.0, selecting GPU and pressing `[g]` falls back to CPU keygen with a clear status message; the GPU pipeline currently powers the benchmark and time-estimate columns.
+The GPU backend computes `scalar * B` (compressed Edwards pubkeys) directly on the device with a complete twisted-Edwards point formula, then the host matches the pubkeys with the same prefix fast-path used by the CPU backend. The WGSL field and group arithmetic is verified against curve25519-dalek (see `src/fe16_ref.rs` and the `gpu_keygen_matches_dalek` test).
+
+GPU keys are stored in Tor's expanded secret-key form (the clamped scalar plus a random signing-nonce prefix), so they drop into `HiddenServiceDir` exactly like CPU-generated keys.
 
 ## Install
 
