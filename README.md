@@ -11,7 +11,7 @@ Generate a custom `.onion` address for your Tor hidden service. Type a word, pic
 │  chars   ›  ✓ 8 chars                                                         │
 │  match   ›  [Prefix]  Suffix  Anywhere    ← →                                 │
 │  backend ›  [CPU]  GPU   8 threads        ↑ ↓                                 │
-│  example ›  firesideabcdefghijklmnop234567abcdefghij.onion                   │
+│  example ›  firesideabcdefghijklmnop234567abcdefghij.onion                    │
 │                                                                               │
 └───────────────────────────────────────────────────────────────────────────────┘
 ```
