@@ -471,7 +471,7 @@ fn draw_time_panel(f: &mut Frame, app: &App, area: Rect) {
     }
     // CPU column
     let cpu_active = matches!(app.backend, Backend::Cpu);
-    if let Some(rate) = app.cpu_benchmark_rate {
+    if let Some(rate) = app.cpu_rate_for_current() {
         header_spans.push(Span::styled(
             format!("{:<13}", format!("CPU {}", format_rate(rate))),
             Style::default()
@@ -486,7 +486,7 @@ fn draw_time_panel(f: &mut Frame, app: &App, area: Rect) {
     }
     // GPU column
     let gpu_active = matches!(app.backend, Backend::Gpu);
-    if let Some(rate) = app.gpu_benchmark_rate {
+    if let Some(rate) = app.gpu_rate_for_current() {
         header_spans.push(Span::styled(
             format!("GPU {}", format_rate(rate)),
             Style::default()
@@ -524,7 +524,7 @@ fn draw_time_panel(f: &mut Frame, app: &App, area: Rect) {
             ));
         }
         // CPU column
-        if let Some(rate) = app.cpu_benchmark_rate {
+        if let Some(rate) = app.cpu_rate_for_current() {
             let secs = quantile_attempts(p, *q) / rate;
             spans.push(Span::styled(
                 format!("{:<13}", format_duration(secs)),
@@ -537,7 +537,7 @@ fn draw_time_panel(f: &mut Frame, app: &App, area: Rect) {
             ));
         }
         // GPU column
-        if let Some(rate) = app.gpu_benchmark_rate {
+        if let Some(rate) = app.gpu_rate_for_current() {
             let secs = quantile_attempts(p, *q) / rate;
             spans.push(Span::styled(
                 format_duration(secs),
@@ -562,6 +562,7 @@ fn draw_status_panel(f: &mut Frame, app: &App, area: Rect) {
             started,
             worker,
             backend,
+            ..
         } => draw_benchmark_status(f, area, *started, worker.attempts(), *backend),
         Mode::Generating {
             started,

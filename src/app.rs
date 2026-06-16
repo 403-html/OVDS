@@ -46,6 +46,7 @@ pub enum Mode {
         started: Instant,
         worker: WorkerState,
         backend: Backend,
+        match_type: MatchType,
     },
     Generating {
         started: Instant,
@@ -126,8 +127,11 @@ pub struct App {
     pub pattern: String,
     pub match_type: MatchType,
     pub mode: Mode,
-    pub cpu_benchmark_rate: Option<f64>,
-    pub gpu_benchmark_rate: Option<f64>,
+    /// Last benchmark rate per backend, tagged with the match type it was measured
+    /// under so the estimate panel never pairs (say) a prefix rate with a suffix
+    /// probability. Use `cpu_rate_for_current` / `gpu_rate_for_current` to read.
+    pub cpu_benchmark: Option<(MatchType, f64)>,
+    pub gpu_benchmark: Option<(MatchType, f64)>,
     pub threads: usize,
     pub backend: Backend,
     pub gpu: Option<Arc<GpuContext>>,
@@ -147,8 +151,8 @@ impl App {
             pattern: String::new(),
             match_type: MatchType::Prefix,
             mode: Mode::Idle,
-            cpu_benchmark_rate: None,
-            gpu_benchmark_rate: None,
+            cpu_benchmark: None,
+            gpu_benchmark: None,
             threads: rayon::current_num_threads(),
             backend: Backend::Cpu,
             gpu,
@@ -179,6 +183,21 @@ impl App {
 
     pub fn cycle_panel(&mut self) {
         self.focused_panel = self.focused_panel.toggle();
+    }
+
+    /// Benchmark rate for the CPU backend, but only if it was measured under the
+    /// currently selected match type (rates differ per mode, so a mismatch would
+    /// give a misleading ETA).
+    pub fn cpu_rate_for_current(&self) -> Option<f64> {
+        self.cpu_benchmark
+            .as_ref()
+            .and_then(|(mt, r)| (*mt == self.match_type).then_some(*r))
+    }
+
+    pub fn gpu_rate_for_current(&self) -> Option<f64> {
+        self.gpu_benchmark
+            .as_ref()
+            .and_then(|(mt, r)| (*mt == self.match_type).then_some(*r))
     }
 
     pub fn pattern_valid(&self) -> bool {
@@ -219,17 +238,38 @@ impl App {
     fn start_benchmark_cpu(&mut self) {
         let worker = WorkerState::new();
         let w = worker.clone();
+        let match_type = self.match_type.clone();
 
         std::thread::spawn(move || {
-            use crate::crypto::generate_keypair;
             rayon::scope(|_| {
                 (0..rayon::current_num_threads()).for_each(|_| {
                     let attempts = Arc::clone(&w.attempts);
                     let stop = Arc::clone(&w.stop);
+                    let match_type = match_type.clone();
                     std::thread::spawn(move || {
+                        use crate::crypto::{MatchType, check_prefix_fast, derive_address_into};
+                        use ed25519_dalek::SigningKey;
+                        // Mirror the generate path's per-key cost: prefix uses the
+                        // SHA3-skipping fast path, suffix/anywhere do full derivation.
+                        let pattern: &[u8] = b"ovdsbench42";
                         let mut rng = rand::thread_rng();
+                        let mut buf = [0u8; 56];
                         while !stop.load(Ordering::Relaxed) {
-                            generate_keypair(&mut rng);
+                            let key = SigningKey::generate(&mut rng);
+                            let hit = match match_type {
+                                MatchType::Prefix => {
+                                    check_prefix_fast(&key.verifying_key().to_bytes(), pattern)
+                                }
+                                MatchType::Suffix => {
+                                    derive_address_into(&key, &mut buf);
+                                    buf.ends_with(pattern)
+                                }
+                                MatchType::Anywhere => {
+                                    derive_address_into(&key, &mut buf);
+                                    buf.windows(pattern.len()).any(|wn| wn == pattern)
+                                }
+                            };
+                            std::hint::black_box(hit);
                             attempts.fetch_add(1, Ordering::Relaxed);
                         }
                     });
@@ -243,8 +283,12 @@ impl App {
             started: Instant::now(),
             worker,
             backend: Backend::Cpu,
+            match_type: self.match_type.clone(),
         };
-        self.status_msg = "Benchmarking CPU key generation...".into();
+        self.status_msg = format!(
+            "Benchmarking CPU key generation ({})...",
+            self.match_type.label()
+        );
     }
 
     fn start_benchmark_gpu(&mut self) {
@@ -258,15 +302,18 @@ impl App {
             return;
         };
 
+        let match_type = self.match_type.clone();
         let status_label = format!(
-            "Benchmarking GPU ({} · {}) - ed25519 keygen...",
+            "Benchmarking GPU ({} · {}) - ed25519 keygen ({})...",
             gpu.backend_label(),
-            gpu.adapter_name
+            gpu.adapter_name,
+            match_type.label()
         );
 
         let worker = WorkerState::new();
         let w = worker.clone();
         let gpu_thread = Arc::clone(&gpu);
+        let mt_thread = match_type.clone();
 
         std::thread::spawn(move || {
             let attempts = Arc::clone(&w.attempts);
@@ -274,7 +321,7 @@ impl App {
             let error = Arc::clone(&w.error);
             // Isolate any wgpu panic (e.g. shader validation) from the TUI.
             let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                crate::gpu::run_keygen_bench(&gpu_thread, attempts, stop, 5.0)
+                crate::gpu::run_keygen_bench(&gpu_thread, mt_thread, attempts, stop, 5.0)
             }));
             match res {
                 Ok(Err(e)) => *error.lock().unwrap() = Some(format!("GPU error: {e}")),
@@ -288,6 +335,7 @@ impl App {
             started: Instant::now(),
             worker,
             backend: Backend::Gpu,
+            match_type,
         };
         self.status_msg = status_label;
     }
@@ -481,6 +529,7 @@ impl App {
                 started,
                 worker,
                 backend,
+                match_type,
             } => {
                 let elapsed = started.elapsed();
                 if worker.stop.load(Ordering::Relaxed) || elapsed >= Duration::from_secs(6) {
@@ -488,20 +537,27 @@ impl App {
                     let secs = elapsed.as_secs_f64().max(0.1);
                     let rate = attempts as f64 / secs;
                     let err = worker.error.lock().unwrap().clone();
+                    let measured = match_type.clone();
                     match backend {
                         Backend::Cpu => {
-                            self.cpu_benchmark_rate = Some(rate);
+                            self.cpu_benchmark = Some((measured.clone(), rate));
                             self.status_msg = format!(
-                                "CPU benchmark done: {:.0} keys/s on {} threads",
-                                rate, self.threads
+                                "CPU benchmark done ({}): {:.0} keys/s on {} threads",
+                                measured.label(),
+                                rate,
+                                self.threads
                             );
                         }
                         Backend::Gpu => {
                             if let Some(e) = err {
                                 self.status_msg = e;
                             } else {
-                                self.gpu_benchmark_rate = Some(rate);
-                                self.status_msg = format!("GPU benchmark done: {:.0} keys/s", rate);
+                                self.gpu_benchmark = Some((measured.clone(), rate));
+                                self.status_msg = format!(
+                                    "GPU benchmark done ({}): {:.0} keys/s",
+                                    measured.label(),
+                                    rate
+                                );
                             }
                         }
                     }

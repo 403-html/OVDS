@@ -491,6 +491,34 @@ fn keygen_dispatch(
     Ok(pairs)
 }
 
+/// Pick the dispatch mode and on-device pattern symbols for a match type. Prefix
+/// and anywhere patterns short enough for the on-device matcher compact their hits
+/// on the device (tiny readback); everything else (suffix, or over-long patterns)
+/// uses the same incremental kernel in write-all mode and is scanned on the host.
+fn pick_mode(match_type: &crate::crypto::MatchType, pattern: &[u8]) -> (u32, Vec<u32>) {
+    use crate::crypto::MatchType;
+    let device_ok = pattern.len() <= MAX_DEVICE_PREFIX && pattern_to_symbols(pattern).is_some();
+    match match_type {
+        MatchType::Prefix if device_ok => (MODE_PREFIX, pattern_to_symbols(pattern).unwrap()),
+        MatchType::Anywhere if device_ok => (MODE_ANYWHERE, pattern_to_symbols(pattern).unwrap()),
+        _ => (MODE_WRITE_ALL, Vec::new()),
+    }
+}
+
+/// Host-side re-verification of a candidate against the full address. Device-matched
+/// candidates are double-checked here; write-all candidates are scanned here.
+fn host_match(match_type: &crate::crypto::MatchType, pattern: &[u8], kp: &GpuKeyPair) -> bool {
+    use crate::crypto::{MatchType, address_from_pubkey, check_prefix_fast};
+    match match_type {
+        MatchType::Prefix => check_prefix_fast(&kp.pubkey, pattern),
+        MatchType::Suffix => address_from_pubkey(&kp.pubkey).ends_with(pattern),
+        MatchType::Anywhere => {
+            let addr = address_from_pubkey(&kp.pubkey);
+            addr.windows(pattern.len()).any(|w| w == pattern)
+        }
+    }
+}
+
 /// GPU search loop: dispatch batches until match or stop. Prefix patterns short
 /// enough for the on-device matcher run in compaction mode (tiny readback);
 /// suffix/anywhere (and over-long prefixes) fall back to write-all + host scan.
@@ -503,36 +531,12 @@ pub fn run_keygen(
     stop: Arc<AtomicBool>,
     result: Arc<Mutex<Option<GpuKeyPair>>>,
 ) -> Result<()> {
-    use crate::crypto::{MatchType, address_from_pubkey, check_prefix_fast};
     use rand::RngCore;
     use rayon::prelude::*;
 
-    // Decide the dispatch mode once. Prefix and anywhere patterns short enough for
-    // the on-device matcher compact their hits on the device (tiny readback).
-    // Everything else (suffix, or over-long patterns) uses the same incremental
-    // kernel in write-all mode and is scanned on the host.
-    let device_ok = pattern.len() <= MAX_DEVICE_PREFIX && pattern_to_symbols(&pattern).is_some();
-    let (mode, pattern_syms) = match match_type {
-        MatchType::Prefix if device_ok => (MODE_PREFIX, pattern_to_symbols(&pattern).unwrap()),
-        MatchType::Anywhere if device_ok => (MODE_ANYWHERE, pattern_to_symbols(&pattern).unwrap()),
-        _ => (MODE_WRITE_ALL, Vec::new()),
-    };
-
-    // Every mode walks BATCH_K candidates per thread now.
+    let (mode, pattern_syms) = pick_mode(&match_type, &pattern);
+    // Every mode walks BATCH_K candidates per thread.
     let per_dispatch = pipe.threads as u64 * BATCH_K as u64;
-
-    // Host re-verification against the full address. Device-matched candidates are
-    // double-checked; write-all candidates are scanned here.
-    let host_match = |kp: &GpuKeyPair| -> bool {
-        match match_type {
-            MatchType::Prefix => check_prefix_fast(&kp.pubkey, &pattern),
-            MatchType::Suffix => address_from_pubkey(&kp.pubkey).ends_with(pattern.as_slice()),
-            MatchType::Anywhere => {
-                let addr = address_from_pubkey(&kp.pubkey);
-                addr.windows(pattern.len()).any(|w| w == pattern.as_slice())
-            }
-        }
-    };
 
     let mut rng = rand::thread_rng();
     let mut batch_id: u32 = 0;
@@ -544,9 +548,15 @@ pub fn run_keygen(
         // Write-all returns ~1M candidates to scan (full SHA3 per key), so fan it
         // out across cores; compaction modes return only a handful of hits.
         let hit = if mode == MODE_WRITE_ALL {
-            pairs.par_iter().find_any(|kp| host_match(kp)).copied()
+            pairs
+                .par_iter()
+                .find_any(|kp| host_match(&match_type, &pattern, kp))
+                .copied()
         } else {
-            pairs.iter().find(|kp| host_match(kp)).copied()
+            pairs
+                .iter()
+                .find(|kp| host_match(&match_type, &pattern, kp))
+                .copied()
         };
         if let Some(kp) = hit {
             *result.lock().unwrap() = Some(kp);
@@ -558,20 +568,24 @@ pub fn run_keygen(
     Ok(())
 }
 
-/// Benchmark real ed25519 keygen throughput for ~`target_secs`. Runs the same
-/// incremental prefix kernel the generator uses (with a representative prefix so
-/// the on-device match cost is included) and counts actual candidates produced.
-/// Matches are ignored - this measures generation rate, not search time, so the
-/// reported keys/s reflects what the GPU can really do.
+/// Benchmark real ed25519 keygen throughput for ~`target_secs` in the same
+/// dispatch mode a search of `match_type` would use, so the reported keys/s
+/// reflects the actual generate path (write-all suffix includes its parallel host
+/// scan; prefix/anywhere include the on-device match). A long representative
+/// pattern keeps the search from short-circuiting during the window; matches are
+/// ignored - this measures generation rate, not search time.
 pub fn run_keygen_bench(
     ctx: &GpuContext,
+    match_type: crate::crypto::MatchType,
     attempts: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
     target_secs: f64,
 ) -> Result<()> {
     use rand::RngCore;
+    use rayon::prelude::*;
     let pipe = KeygenPipeline::new(ctx)?;
-    let pattern_syms = [0u32; 8]; // representative 8-char prefix; matches ignored
+    let pattern = b"ovdsbench42".to_vec(); // 11 valid base32 chars; never matches
+    let (mode, pattern_syms) = pick_mode(&match_type, &pattern);
     let per_dispatch = pipe.threads as u64 * BATCH_K as u64;
     let mut rng = rand::thread_rng();
     let mut base_seed = [0u8; 32];
@@ -579,7 +593,15 @@ pub fn run_keygen_bench(
     let start = Instant::now();
     while !stop.load(Ordering::Relaxed) && start.elapsed().as_secs_f64() < target_secs {
         rng.fill_bytes(&mut base_seed);
-        keygen_dispatch(ctx, &pipe, &base_seed, batch_id, MODE_PREFIX, &pattern_syms)?;
+        let pairs = keygen_dispatch(ctx, &pipe, &base_seed, batch_id, mode, &pattern_syms)?;
+        // Write-all measures generation plus the parallel host scan it really does.
+        if mode == MODE_WRITE_ALL {
+            let _ = std::hint::black_box(
+                pairs
+                    .par_iter()
+                    .any(|kp| host_match(&match_type, &pattern, kp)),
+            );
+        }
         attempts.fetch_add(per_dispatch, Ordering::Relaxed);
         batch_id = batch_id.wrapping_add(1);
     }

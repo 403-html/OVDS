@@ -1,16 +1,9 @@
 use data_encoding::BASE32_NOPAD;
 use ed25519_dalek::SigningKey;
-use rand::rngs::ThreadRng;
 use sha2::Sha512;
 use sha3::{Digest, Sha3_256};
 use std::fs;
 use std::path::PathBuf;
-
-pub fn generate_keypair(rng: &mut ThreadRng) -> (SigningKey, String) {
-    let key = SigningKey::generate(rng);
-    let address = derive_address(&key);
-    (key, address)
-}
 
 pub fn derive_address(key: &SigningKey) -> String {
     let mut buf = [0u8; 56];
@@ -228,7 +221,8 @@ mod tests {
     #[test]
     fn address_is_56_chars() {
         let mut rng = rand::thread_rng();
-        let (key, addr) = generate_keypair(&mut rng);
+        let key = SigningKey::generate(&mut rng);
+        let addr = derive_address(&key);
         assert_eq!(
             addr.len(),
             56,
@@ -239,7 +233,6 @@ mod tests {
             addr.chars()
                 .all(|c| "abcdefghijklmnopqrstuvwxyz234567".contains(c))
         );
-        let _ = key;
     }
 
     #[test]
