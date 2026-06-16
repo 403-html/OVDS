@@ -501,8 +501,7 @@ impl App {
                                 self.status_msg = e;
                             } else {
                                 self.gpu_benchmark_rate = Some(rate);
-                                self.status_msg =
-                                    format!("GPU benchmark done: {:.0} keys/s", rate);
+                                self.status_msg = format!("GPU benchmark done: {:.0} keys/s", rate);
                             }
                         }
                     }
