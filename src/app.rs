@@ -297,10 +297,20 @@ impl App {
             return;
         }
 
-        // v0.2.0: full ed25519 scalar mult on GPU is forthcoming; for now the
-        // GPU backend selection still runs CPU keygen with a clear status.
-        if matches!(self.backend, Backend::Gpu) {
-            self.status_msg = "GPU keygen pending (v0.3.0); using CPU keygen this run".into();
+        match self.backend {
+            Backend::Gpu if self.gpu.is_some() => {
+                self.start_generate_gpu();
+                return;
+            }
+            Backend::Gpu => {
+                self.status_msg = format!(
+                    "GPU unavailable: {}; using CPU",
+                    self.gpu_init_error
+                        .clone()
+                        .unwrap_or_else(|| "no adapter".into())
+                );
+            }
+            Backend::Cpu => {}
         }
 
         let worker = WorkerState::new();
@@ -393,6 +403,64 @@ impl App {
         self.status_msg = "Searching...".into();
     }
 
+    fn start_generate_gpu(&mut self) {
+        let Some(gpu) = self.gpu.clone() else {
+            self.status_msg = "GPU unavailable".into();
+            return;
+        };
+
+        let worker = WorkerState::new();
+        let rate_tracker = Arc::new(Mutex::new(RateTracker::new()));
+        let w = worker.clone();
+        let pattern = self.pattern.clone().into_bytes();
+        let match_type = self.match_type.clone();
+
+        std::thread::spawn(move || {
+            use crate::crypto::{address_from_pubkey, save_keys_expanded};
+            let attempts = Arc::clone(&w.attempts);
+            let stop = Arc::clone(&w.stop);
+            let error = Arc::clone(&w.error);
+            let result = Arc::clone(&w.result);
+
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let pipe = crate::gpu::KeygenPipeline::new(&gpu)?;
+                let found = Arc::new(Mutex::new(None));
+                crate::gpu::run_keygen(
+                    &gpu,
+                    &pipe,
+                    pattern,
+                    match_type,
+                    attempts,
+                    stop,
+                    Arc::clone(&found),
+                )?;
+                let kp = found.lock().unwrap().take();
+                anyhow::Ok(kp)
+            }));
+
+            match res {
+                Ok(Ok(Some(kp))) => {
+                    let addr_bytes = address_from_pubkey(&kp.pubkey);
+                    let address = String::from_utf8(addr_bytes.to_vec()).unwrap();
+                    let key_path = save_keys_expanded(&kp.pubkey, &kp.scalar, &address)
+                        .unwrap_or_else(|_| PathBuf::from("."));
+                    *result.lock().unwrap() = Some(FoundResult { address, key_path });
+                }
+                Ok(Ok(None)) => {} // stopped without a match
+                Ok(Err(e)) => *error.lock().unwrap() = Some(format!("GPU error: {e}")),
+                Err(_) => *error.lock().unwrap() = Some("GPU panicked (see ovds-panic.log)".into()),
+            }
+            w.stop();
+        });
+
+        self.mode = Mode::Generating {
+            started: Instant::now(),
+            worker,
+            rate_tracker,
+        };
+        self.status_msg = "Searching on GPU...".into();
+    }
+
     pub fn stop(&mut self) {
         match &self.mode {
             Mode::Benchmarking { worker, .. } => worker.stop(),
@@ -447,8 +515,9 @@ impl App {
                 let now = Instant::now();
                 rate_tracker.lock().unwrap().update(now, attempts);
 
-                // check for result - drop MutexGuard before mutating self.mode
+                // Snapshot result/error and drop the MutexGuards before mutating self.mode.
                 let found = worker.result.lock().unwrap().clone();
+                let err = worker.error.lock().unwrap().clone();
                 if let Some(found) = found {
                     let elapsed = started.elapsed();
                     self.mode = Mode::Found {
@@ -457,6 +526,10 @@ impl App {
                         elapsed,
                     };
                     self.status_msg = "Found!".into();
+                } else if let Some(err) = err {
+                    // GPU generate thread failed (e.g. shader/device error).
+                    self.status_msg = err;
+                    self.mode = Mode::Idle;
                 }
             }
             _ => {}
