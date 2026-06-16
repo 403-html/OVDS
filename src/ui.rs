@@ -563,13 +563,14 @@ fn draw_status_panel(f: &mut Frame, app: &App, area: Rect) {
             started,
             worker,
             rate_tracker,
+            backend,
         } => {
             let attempts = worker.attempts();
             let tracker = rate_tracker.lock().unwrap();
             let rate = tracker.last_rate;
             let history: Vec<u64> = tracker.history.iter().copied().collect();
             drop(tracker);
-            draw_generate_status(f, app, area, *started, attempts, rate, &history)
+            draw_generate_status(f, app, area, *started, attempts, rate, &history, *backend)
         }
         Mode::Found {
             result,
@@ -721,6 +722,7 @@ fn draw_benchmark_status(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_generate_status(
     f: &mut Frame,
     app: &App,
@@ -729,16 +731,29 @@ fn draw_generate_status(
     attempts: u64,
     rate: f64,
     history: &[u64],
+    backend: Backend,
 ) {
+    let title = match backend {
+        Backend::Cpu => " GENERATING · CPU ",
+        Backend::Gpu => " GENERATING · GPU ",
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(ACCENT))
         .title(Span::styled(
-            " GENERATING ",
+            title,
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(area);
     f.render_widget(block, area);
+
+    let backend_detail = match (backend, &app.gpu) {
+        (Backend::Cpu, _) => format!("CPU · {} threads", app.threads),
+        (Backend::Gpu, Some(ctx)) => {
+            format!("GPU · {} · {}", ctx.backend_label(), ctx.adapter_name)
+        }
+        (Backend::Gpu, None) => "GPU".into(),
+    };
 
     let elapsed = started.elapsed();
     let p = match_probability(app.pattern.len(), &app.match_type);
@@ -777,7 +792,13 @@ fn draw_generate_status(
 
     f.render_widget(
         Paragraph::new(Text::from(vec![
-            Line::raw(""),
+            Line::from(vec![
+                Span::styled("  backend  ", Style::default().fg(DIM)),
+                Span::styled(
+                    backend_detail,
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ),
+            ]),
             Line::from(vec![
                 Span::styled("  tries    ", Style::default().fg(DIM)),
                 Span::styled(

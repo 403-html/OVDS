@@ -51,6 +51,7 @@ pub enum Mode {
         started: Instant,
         worker: WorkerState,
         rate_tracker: Arc<Mutex<RateTracker>>,
+        backend: Backend,
     },
     Found {
         result: FoundResult,
@@ -399,6 +400,7 @@ impl App {
             started: Instant::now(),
             worker,
             rate_tracker,
+            backend: Backend::Cpu,
         };
         self.status_msg = "Searching...".into();
     }
@@ -457,6 +459,7 @@ impl App {
             started: Instant::now(),
             worker,
             rate_tracker,
+            backend: Backend::Gpu,
         };
         self.status_msg = "Searching on GPU...".into();
     }
@@ -510,6 +513,7 @@ impl App {
                 started,
                 worker,
                 rate_tracker,
+                ..
             } => {
                 let attempts = worker.attempts();
                 let now = Instant::now();
