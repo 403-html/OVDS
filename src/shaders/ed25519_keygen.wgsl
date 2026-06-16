@@ -1,29 +1,56 @@
-// Ed25519 scalar-mult-base kernel for OVDS GPU vanity search.
+// Ed25519 keygen kernels for OVDS GPU vanity search.
 //
-// Per thread:
-//   1. derive 32-byte scalar bytes from (base_seed XOR thread_idx), clamp
-//   2. compute pubkey = scalar * B (compressed Edwards Y, 32 bytes)
-//   3. write (pubkey || scalar_bytes) to output
-//
-// Host then scans pubkeys with check_prefix_fast and reconstructs full key
-// on match.
+// Two scalar-mult strategies share the same field/group math:
+//   * Fixed-base comb (comb_scalarmult): one scalar * B with a precomputed
+//     table of multiples (build_table), no doublings.
+//   * Incremental batch (prefix mode of main): each thread computes one start
+//     point P0 = s0*B via the comb, then walks P0, P0+B, P0+2B, ... emitting
+//     BATCH_K candidates. Each step is a single projective add and all the
+//     per-candidate inversions are batched into one (Montgomery's trick), so
+//     the amortized cost per candidate is ~one point add. Matching prefixes are
+//     compacted on-device; the scalar for candidate j is just s0 + j.
 //
 // Field representation: fe25519 = array<u32, 16>, each limb holds 16 bits.
 // All arithmetic is unsigned. Subtraction uses an additive form (a - b = a + 2p - b)
 // so limbs never go negative.
 
 // Params layout (storage buffer, std430 packing - each u32 takes 4 bytes):
-//   [0..8]   base_seed (8 LE u32)
-//   [8]      batch_id
-//   [9]      threads
-//   [10..12] pad
-//   [12..28] bX (16 limbs)
-//   [28..44] bY
-//   [44..60] bZ
-//   [60..76] bT
-@group(0) @binding(0) var<storage, read> params: array<u32, 76>;
-// Output: per thread, 8 u32 pubkey + 8 u32 scalar (clamped LE) = 16 u32
-@group(0) @binding(1) var<storage, read_write> output: array<u32>;
+//   [0..8]    base_seed (8 LE u32)
+//   [8]       batch_id
+//   [9]       threads
+//   [10]      mode (0 = on-device prefix match + compaction, 1 = write-all by index)
+//   [11]      pattern_len (base32 chars, prefix mode only)
+//   [12..28]  bX (16 limbs)
+//   [28..44]  bY
+//   [44..60]  bZ
+//   [60..76]  bT
+//   [76..124] pattern (one base32 5-bit value per char, prefix mode only)
+@group(0) @binding(0) var<storage, read> params: array<u32, 128>;
+// Comb table: COMB_WINDOWS * COMB_PTS_PER_WIN points, each 64 u32 (X|Y|Z|T,
+// 16 limbs each). Built once by build_table, read by the main keygen kernel.
+@group(0) @binding(1) var<storage, read_write> table: array<u32>;
+// Output buffer (atomic so prefix mode can compact matches via atomicAdd):
+//   mode 0 (prefix): [0] = match count, records start at OUT_HEADER, 16 u32 each
+//   mode 1 (write-all): record i at i*16, 8 u32 pubkey + 8 u32 scalar
+@group(0) @binding(2) var<storage, read_write> output: array<atomic<u32>>;
+// Scratch for incremental batch generation: per candidate 4 field elements
+// (X, Y, Z, running-prefix-product), 16 limbs each = 64 u32.
+@group(0) @binding(3) var<storage, read_write> scratch: array<u32>;
+
+// Fixed-base comb parameters. W must divide 32 so a digit never straddles two
+// scalar limbs. 32 windows * 8 bits = 256 bits covers any clamped scalar.
+const COMB_W: u32 = 8u;
+const COMB_WINDOWS: u32 = 32u;
+const COMB_PTS_PER_WIN: u32 = 256u; // 1 << COMB_W
+const GE_WORDS: u32 = 64u;         // 4 field elements * 16 limbs
+const OUT_HEADER: u32 = 4u;
+const MAX_MATCHES: u32 = 256u;
+
+// Incremental batch: each thread computes P0 = s0*B once (comb), then walks
+// P0, P0+B, P0+2B, ... emitting BATCH_K candidates. Each step is one projective
+// point add; the per-candidate inversions are batched (one inversion/thread).
+const BATCH_K: u32 = 64u;
+const SCRATCH_WORDS_PER: u32 = 64u; // 4 field elements * 16 limbs
 
 // --- u64 emulation as vec2<u32> ---
 
@@ -333,20 +360,43 @@ fn ge_double(p: Ge) -> Ge {
     return ge_add(p, p);
 }
 
-// Scalar mult basepoint: Q = scalar * B, simple double-and-add (MSB-first).
-// scalar is 32 bytes LE, but we process MSB-first by walking u32 limbs and bits.
-fn ge_scalarmult_base(B: Ge, scalar: array<u32, 8>) -> Ge {
+// --- comb table storage ---
+
+fn store_ge(slot: u32, g: Ge) {
+    let o = slot * GE_WORDS;
+    var gx = g.X; var gy = g.Y; var gz = g.Z; var gt = g.T;
+    for (var i = 0u; i < 16u; i = i + 1u) {
+        table[o + i] = gx[i];
+        table[o + 16u + i] = gy[i];
+        table[o + 32u + i] = gz[i];
+        table[o + 48u + i] = gt[i];
+    }
+}
+
+fn load_ge(slot: u32) -> Ge {
+    let o = slot * GE_WORDS;
+    var g: Ge;
+    for (var i = 0u; i < 16u; i = i + 1u) {
+        g.X[i] = table[o + i];
+        g.Y[i] = table[o + 16u + i];
+        g.Z[i] = table[o + 32u + i];
+        g.T[i] = table[o + 48u + i];
+    }
+    return g;
+}
+
+// Fixed-base comb (windowed) scalar mult: Q = scalar * B. No doublings - each
+// window contributes one precomputed multiple table[window][digit]. The
+// complete addition handles the identity, so zero digits are simply skipped.
+fn comb_scalarmult(scalar: array<u32, 8>) -> Ge {
     var ss = scalar;
     var Q = ge_identity();
-    // 256 bits, MSB first. scalar is 8 LE u32; bit i is in scalar[i/32] bit (i%32).
-    // Walk from bit 255 down to 0.
-    for (var bit_i = 0u; bit_i < 256u; bit_i = bit_i + 1u) {
-        let i = 255u - bit_i;
-        Q = ge_double(Q);
-        let limb = ss[i >> 5u];
-        let b = (limb >> (i & 31u)) & 1u;
-        if (b == 1u) {
-            Q = ge_add(Q, B);
+    for (var i = 0u; i < COMB_WINDOWS; i = i + 1u) {
+        let bitpos = i * COMB_W;
+        let limb = ss[bitpos >> 5u];
+        let digit = (limb >> (bitpos & 31u)) & (COMB_PTS_PER_WIN - 1u);
+        if (digit != 0u) {
+            Q = ge_add(Q, load_ge(i * COMB_PTS_PER_WIN + digit));
         }
     }
     return Q;
@@ -402,6 +452,99 @@ fn load_basepoint() -> Ge {
     return B;
 }
 
+// --- on-device base32 prefix match ---
+
+// Byte `idx` (0..31) of the compressed pubkey (8 LE u32 = 32 bytes).
+fn pk_byte(pk: array<u32, 8>, idx: u32) -> u32 {
+    var p = pk;
+    return (p[idx >> 2u] >> ((idx & 3u) * 8u)) & 0xFFu;
+}
+
+// 5-bit base32 symbol value at char `j`. The byte stream is read MSB-first
+// (RFC 4648), so char j covers bits [5j, 5j+5). Caller guarantees the 5 bits
+// fall within bytes 0..31 (pattern_len capped at 48 host-side, max bit 235).
+fn base32_sym(pk: array<u32, 8>, j: u32) -> u32 {
+    let bit = j * 5u;
+    let byte_idx = bit >> 3u;
+    let bit_in_byte = bit & 7u;
+    let win = (pk_byte(pk, byte_idx) << 8u) | pk_byte(pk, byte_idx + 1u);
+    return (win >> (11u - bit_in_byte)) & 0x1Fu;
+}
+
+fn matches_prefix(pk: array<u32, 8>, plen: u32) -> bool {
+    for (var j = 0u; j < plen; j = j + 1u) {
+        if (base32_sym(pk, j) != params[76u + j]) { return false; }
+    }
+    return true;
+}
+
+fn write_record(o: u32, pubkey: array<u32, 8>, scalar: array<u32, 8>) {
+    var pk = pubkey;
+    var sc = scalar;
+    for (var i = 0u; i < 8u; i = i + 1u) {
+        atomicStore(&output[o + i], pk[i]);
+        atomicStore(&output[o + 8u + i], sc[i]);
+    }
+}
+
+// --- incremental batch helpers ---
+
+fn scratch_store_fe(off: u32, v: array<u32, 16>) {
+    var vv = v;
+    for (var i = 0u; i < 16u; i = i + 1u) { scratch[off + i] = vv[i]; }
+}
+
+fn scratch_load_fe(off: u32) -> array<u32, 16> {
+    var r: array<u32, 16>;
+    for (var i = 0u; i < 16u; i = i + 1u) { r[i] = scratch[off + i]; }
+    return r;
+}
+
+// Compress a point given a precomputed 1/Z (from the batched inversion).
+fn compress_zinv(X: array<u32, 16>, Y: array<u32, 16>, zinv: array<u32, 16>) -> array<u32, 8> {
+    let x_aff = fe_mul(X, zinv);
+    let y_aff = fe_mul(Y, zinv);
+    var bytes = fe_pack(y_aff);
+    let parity = fe_isnegative(x_aff);
+    bytes[7] = bytes[7] | (parity << 31u);
+    return bytes;
+}
+
+// scalar (8 LE u32) + small integer j, with carry propagation.
+fn scalar_add_u32(s: array<u32, 8>, j: u32) -> array<u32, 8> {
+    var r = s;
+    var carry = j;
+    for (var i = 0u; i < 8u; i = i + 1u) {
+        let prev = r[i];
+        let lo = prev + carry;
+        r[i] = lo;
+        carry = select(0u, 1u, lo < prev);
+    }
+    return r;
+}
+
+// --- comb table builder (run once at pipeline init) ---
+
+@compute @workgroup_size(1)
+fn build_table(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x != 0u) { return; }
+    var base = load_basepoint(); // window 0 base = B
+    for (var i = 0u; i < COMB_WINDOWS; i = i + 1u) {
+        let win = i * COMB_PTS_PER_WIN;
+        store_ge(win, ge_identity());
+        var acc = base;
+        store_ge(win + 1u, acc);
+        for (var k = 2u; k < COMB_PTS_PER_WIN; k = k + 1u) {
+            acc = ge_add(acc, base);
+            store_ge(win + k, acc);
+        }
+        // Next window base = base * 2^COMB_W.
+        for (var d = 0u; d < COMB_W; d = d + 1u) { base = ge_double(base); }
+    }
+}
+
+// --- main keygen kernel ---
+
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
@@ -409,11 +552,53 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (idx >= threads) { return; }
     let base_seed = load_base_seed();
     let batch_id = params[8u];
+    let mode = params[10u];
+    var s0 = derive_scalar(base_seed, batch_id, idx);
+
+    // Write-all mode: one full keypair per thread (the dalek regression path).
+    if (mode == 1u) {
+        let Q = comb_scalarmult(s0);
+        let pubkey = ge_compress(Q);
+        write_record(idx * 16u, pubkey, s0);
+        return;
+    }
+
+    // Prefix mode: incremental generation + batched inversion.
+    let plen = params[11u];
     let B = load_basepoint();
-    var scalar = derive_scalar(base_seed, batch_id, idx);
-    let Q = ge_scalarmult_base(B, scalar);
-    var pubkey = ge_compress(Q);
-    let base = idx * 16u;
-    for (var i = 0u; i < 8u; i = i + 1u) { output[base + i] = pubkey[i]; }
-    for (var i = 0u; i < 8u; i = i + 1u) { output[base + 8u + i] = scalar[i]; }
+    var P = comb_scalarmult(s0); // P0 = s0 * B (projective)
+    let sbase = idx * BATCH_K * SCRATCH_WORDS_PER;
+
+    // Forward pass: emit P0, P0+B, ... storing (X,Y,Z) and the running product
+    // of Z values so each 1/Z_j can be recovered after a single inversion.
+    var acc = fe_one();
+    for (var j = 0u; j < BATCH_K; j = j + 1u) {
+        let o = sbase + j * SCRATCH_WORDS_PER;
+        scratch_store_fe(o, P.X);
+        scratch_store_fe(o + 16u, P.Y);
+        scratch_store_fe(o + 32u, P.Z);
+        scratch_store_fe(o + 48u, acc); // prefix product before folding in Z_j
+        acc = fe_mul(acc, P.Z);
+        P = ge_add(P, B);
+    }
+
+    // One inversion for the whole batch.
+    var inv = fe_invert(acc);
+
+    // Backward pass: 1/Z_j = inv * prefix_j, then strip Z_j out of inv.
+    for (var jj = 0u; jj < BATCH_K; jj = jj + 1u) {
+        let j = BATCH_K - 1u - jj;
+        let o = sbase + j * SCRATCH_WORDS_PER;
+        let zj = scratch_load_fe(o + 32u);
+        let pre = scratch_load_fe(o + 48u);
+        let zinv = fe_mul(inv, pre);
+        inv = fe_mul(inv, zj);
+        let pubkey = compress_zinv(scratch_load_fe(o), scratch_load_fe(o + 16u), zinv);
+        if (matches_prefix(pubkey, plen)) {
+            let slot = atomicAdd(&output[0u], 1u);
+            if (slot < MAX_MATCHES) {
+                write_record(OUT_HEADER + slot * 16u, pubkey, scalar_add_u32(s0, j));
+            }
+        }
+    }
 }

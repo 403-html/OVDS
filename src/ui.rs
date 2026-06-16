@@ -469,14 +469,14 @@ fn draw_time_panel(f: &mut Frame, app: &App, area: Rect) {
     let cpu_active = matches!(app.backend, Backend::Cpu);
     if let Some(rate) = app.cpu_benchmark_rate {
         header_spans.push(Span::styled(
-            format!("CPU {:<7}", format_rate(rate)),
+            format!("{:<13}", format!("CPU {}", format_rate(rate))),
             Style::default()
                 .fg(if cpu_active { OK } else { DIM })
                 .add_modifier(Modifier::BOLD),
         ));
     } else {
         header_spans.push(Span::styled(
-            "CPU [b]    ",
+            format!("{:<13}", "CPU [b]"),
             Style::default().fg(DIM).add_modifier(Modifier::ITALIC),
         ));
     }
@@ -523,12 +523,12 @@ fn draw_time_panel(f: &mut Frame, app: &App, area: Rect) {
         if let Some(rate) = app.cpu_benchmark_rate {
             let secs = quantile_attempts(p, *q) / rate;
             spans.push(Span::styled(
-                format!("{:<11}", format_duration(secs)),
+                format!("{:<13}", format_duration(secs)),
                 Style::default().fg(if cpu_active { OK } else { DIM }),
             ));
         } else {
             spans.push(Span::styled(
-                format!("{:<11}", "-"),
+                format!("{:<13}", "-"),
                 Style::default().fg(DIM),
             ));
         }
@@ -686,7 +686,7 @@ fn draw_benchmark_status(
 
     let unit = match backend {
         Backend::Cpu => "keys/s",
-        Backend::Gpu => "SHA-256/s",
+        Backend::Gpu => "keys/s",
     };
     let label = format!(
         " {:.0}s / {:.0}s  |  {} {} ",
@@ -706,7 +706,7 @@ fn draw_benchmark_status(
 
     let work_label = match backend {
         Backend::Cpu => "keypairs generated",
-        Backend::Gpu => "SHA-256 ops dispatched",
+        Backend::Gpu => "keys generated",
     };
     f.render_widget(
         Paragraph::new(Text::from(vec![

@@ -1,9 +1,11 @@
 //! GPU compute backend.
 //!
-//! v0.3.0 ships both the SHA-256 benchmark pipeline (run_bench) and a real
-//! ed25519 scalar-mult kernel (KeygenPipeline) that produces clamped scalars
-//! and compressed pubkeys on the device. The host then scans pubkeys against
-//! the requested pattern using the existing CPU prefix fast-path.
+//! Ships the ed25519 keygen pipeline (KeygenPipeline) plus a benchmark
+//! (run_keygen_bench) that measures real key-generation throughput on the same
+//! kernel. For prefix search the keygen kernel uses
+//! incremental generation with batched inversion (one point add per candidate,
+//! amortized) and matches prefixes on-device, returning only the matches.
+//! Suffix/anywhere fall back to a write-all kernel scanned on the host.
 //!
 //! Targets:
 //!   - Metal on macOS
@@ -49,12 +51,15 @@ impl GpuContext {
         let adapter_name = info.name.clone();
         let backend = info.backend;
 
+        // The incremental keygen needs a large scratch buffer (one binding holds
+        // threads * BATCH_K points), well past downlevel defaults, so request the
+        // adapter's real limits.
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("ovds-gpu"),
                     required_features: wgpu::Features::empty(),
-                    required_limits: wgpu::Limits::downlevel_defaults(),
+                    required_limits: adapter.limits(),
                     memory_hints: wgpu::MemoryHints::Performance,
                 },
                 None,
@@ -80,144 +85,6 @@ impl GpuContext {
             wgpu::Backend::Empty => "none",
         }
     }
-}
-
-/// Iterated SHA-256 benchmark shader. Each thread loops `iterations` SHA-256
-/// compressions over its own seed and writes the final digest. Total hash ops
-/// = threads * iterations.
-const BENCH_SHADER: &str = include_str!("shaders/bench_sha256.wgsl");
-
-#[repr(C)]
-#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-struct BenchParams {
-    iterations: u32,
-    _pad: [u32; 3],
-}
-
-/// Run iterated SHA-256 on GPU for ~`target_secs` seconds, updating
-/// `total_hashes` as each dispatch completes. Stops early if `stop` is set.
-pub fn run_bench(
-    ctx: &GpuContext,
-    total_hashes: Arc<AtomicU64>,
-    stop: Arc<AtomicBool>,
-    target_secs: f64,
-) -> Result<()> {
-    let threads: u32 = 65_536;
-    let workgroup_size: u32 = 64;
-    let workgroups = threads / workgroup_size;
-    let iters_per_dispatch: u32 = 1024;
-
-    let shader = ctx
-        .device
-        .create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("bench-sha256"),
-            source: wgpu::ShaderSource::Wgsl(BENCH_SHADER.into()),
-        });
-
-    let params_buf = ctx
-        .device
-        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("params"),
-            contents: bytemuck::bytes_of(&BenchParams {
-                iterations: iters_per_dispatch,
-                _pad: [0; 3],
-            }),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-
-    let output_size = (threads as u64) * 8 * 4; // 8 u32 per thread
-    let output_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("output"),
-        size: output_size,
-        usage: wgpu::BufferUsages::STORAGE,
-        mapped_at_creation: false,
-    });
-
-    let bgl = ctx
-        .device
-        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("bench-bgl"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-            ],
-        });
-
-    let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("bench-bg"),
-        layout: &bgl,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: params_buf.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: output_buf.as_entire_binding(),
-            },
-        ],
-    });
-
-    let pl = ctx
-        .device
-        .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("bench-pl"),
-            bind_group_layouts: &[&bgl],
-            push_constant_ranges: &[],
-        });
-
-    let pipeline = ctx
-        .device
-        .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("bench-pipeline"),
-            layout: Some(&pl),
-            module: &shader,
-            entry_point: "main",
-            cache: None,
-            compilation_options: Default::default(),
-        });
-
-    let start = Instant::now();
-    while !stop.load(Ordering::Relaxed) && start.elapsed().as_secs_f64() < target_secs {
-        let mut enc = ctx
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("bench-enc"),
-            });
-        {
-            let mut cpass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("bench-pass"),
-                timestamp_writes: None,
-            });
-            cpass.set_pipeline(&pipeline);
-            cpass.set_bind_group(0, &bg, &[]);
-            cpass.dispatch_workgroups(workgroups, 1, 1);
-        }
-        ctx.queue.submit(Some(enc.finish()));
-        // Block until GPU finishes this batch so timing & counter stay honest.
-        ctx.device.poll(wgpu::Maintain::Wait);
-        let done = (threads as u64) * (iters_per_dispatch as u64);
-        total_hashes.fetch_add(done, Ordering::Relaxed);
-    }
-    Ok(())
 }
 
 // ============================================================================
@@ -322,19 +189,40 @@ fn bytes_to_fe16(b: &[u8; 32]) -> [u32; 16] {
     r
 }
 
+/// Dispatch modes (must match the `mode` param in ed25519_keygen.wgsl).
+const MODE_PREFIX: u32 = 0; // on-device prefix match + atomic compaction
+const MODE_WRITE_ALL: u32 = 1; // every thread writes its keypair by index
+
+const KEYGEN_THREADS: u32 = 16_384;
+const KEYGEN_WORKGROUP_SIZE: u32 = 64;
+/// Candidates generated per thread in prefix mode (mirrors BATCH_K in the shader).
+const BATCH_K: u32 = 64;
+const SCRATCH_WORDS_PER: u64 = 64; // 4 field elements * 16 limbs
+// Comb table geometry (mirrors COMB_* in the shader).
+const COMB_WINDOWS: u32 = 32;
+const COMB_PTS_PER_WIN: u32 = 256;
+const GE_WORDS: u32 = 64;
+const TABLE_WORDS: u64 = (COMB_WINDOWS * COMB_PTS_PER_WIN * GE_WORDS) as u64;
+const OUT_HEADER: usize = 4;
+const MAX_MATCHES: usize = 256;
+const PARAMS_WORDS: usize = 128;
+/// Longest prefix the on-device base32 match supports: char j reads bytes
+/// `5j/8` and `5j/8 + 1`, so j <= 47 keeps both bytes within the 32-byte pubkey.
+const MAX_DEVICE_PREFIX: usize = 48;
+
 pub struct KeygenPipeline {
-    pipeline: wgpu::ComputePipeline,
-    bgl: wgpu::BindGroupLayout,
+    main_pipeline: wgpu::ComputePipeline,
+    bind_group: wgpu::BindGroup,
+    params_buf: wgpu::Buffer,
+    output_buf: wgpu::Buffer,
+    staging_buf: wgpu::Buffer,
     pub threads: u32,
     workgroups: u32,
-    bx: [u32; 16],
-    by: [u32; 16],
-    bz: [u32; 16],
-    bt: [u32; 16],
+    /// Params with the basepoint (and threads) pre-filled; per-dispatch fields
+    /// (seed, batch, mode, pattern) are overwritten before each submit.
+    base_params: [u32; PARAMS_WORDS],
+    output_size: u64,
 }
-
-const KEYGEN_THREADS: u32 = 8192;
-const KEYGEN_WORKGROUP_SIZE: u32 = 64;
 
 impl KeygenPipeline {
     pub fn new(ctx: &GpuContext) -> Result<Self> {
@@ -344,31 +232,25 @@ impl KeygenPipeline {
                 label: Some("ed25519-keygen"),
                 source: wgpu::ShaderSource::Wgsl(KEYGEN_SHADER.into()),
             });
+        let storage_entry = |binding: u32, read_only: bool| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
         let bgl = ctx
             .device
             .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("keygen-bgl"),
                 entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: false },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
+                    storage_entry(0, true),  // params
+                    storage_entry(1, false), // comb table (built then read)
+                    storage_entry(2, false), // output (atomic)
+                    storage_entry(3, false), // incremental scratch
                 ],
             });
         let pl = ctx
@@ -378,46 +260,125 @@ impl KeygenPipeline {
                 bind_group_layouts: &[&bgl],
                 push_constant_ranges: &[],
             });
-        let pipeline = ctx
-            .device
-            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("keygen-pipeline"),
-                layout: Some(&pl),
-                module: &shader,
-                entry_point: "main",
-                cache: None,
-                compilation_options: Default::default(),
-            });
+        let make_pipeline = |entry: &'static str| {
+            ctx.device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some(entry),
+                    layout: Some(&pl),
+                    module: &shader,
+                    entry_point: entry,
+                    cache: None,
+                    compilation_options: Default::default(),
+                })
+        };
+        let build_pipeline = make_pipeline("build_table");
+        let main_pipeline = make_pipeline("main");
+
+        // Basepoint extended coords (Z=1, T=X*Y) for the table builder.
         let bx = bytes_to_fe16(&BX_LE);
         let by = bytes_to_fe16(&BY_LE);
         let mut bz = [0u32; 16];
         bz[0] = 1;
-        let bt_bytes = field_mul_p(&BX_LE, &BY_LE);
-        let bt = bytes_to_fe16(&bt_bytes);
+        let bt = bytes_to_fe16(&field_mul_p(&BX_LE, &BY_LE));
+
+        let mut base_params = [0u32; PARAMS_WORDS];
+        base_params[9] = KEYGEN_THREADS;
+        base_params[12..28].copy_from_slice(&bx);
+        base_params[28..44].copy_from_slice(&by);
+        base_params[44..60].copy_from_slice(&bz);
+        base_params[60..76].copy_from_slice(&bt);
+
+        let params_buf = ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("keygen-params"),
+                contents: bytemuck::cast_slice(&base_params),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            });
+        let table_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("keygen-table"),
+            size: TABLE_WORDS * 4,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        // Sized for write-all mode (the largest layout); prefix mode uses only
+        // the small header + matches region at the front.
+        let output_size = (KEYGEN_THREADS as u64) * 16 * 4;
+        let output_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("keygen-output"),
+            size: output_size,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let staging_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("keygen-staging"),
+            size: output_size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        // Per-candidate scratch (prefix mode). threads * BATCH_K * 4 field elems.
+        let scratch_size = (KEYGEN_THREADS as u64) * (BATCH_K as u64) * SCRATCH_WORDS_PER * 4;
+        let scratch_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("keygen-scratch"),
+            size: scratch_size,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("keygen-bg"),
+            layout: &bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: table_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: output_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: scratch_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        // Build the comb table once. It stays resident in table_buf and is read
+        // by every subsequent main dispatch.
+        let mut enc = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("table-build-enc"),
+            });
+        {
+            let mut cpass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("table-build-pass"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&build_pipeline);
+            cpass.set_bind_group(0, &bind_group, &[]);
+            cpass.dispatch_workgroups(1, 1, 1);
+        }
+        ctx.queue.submit(Some(enc.finish()));
+        ctx.device.poll(wgpu::Maintain::Wait);
+
         Ok(Self {
-            pipeline,
-            bgl,
+            main_pipeline,
+            bind_group,
+            params_buf,
+            output_buf,
+            staging_buf,
             threads: KEYGEN_THREADS,
             workgroups: KEYGEN_THREADS / KEYGEN_WORKGROUP_SIZE,
-            bx,
-            by,
-            bz,
-            bt,
+            base_params,
+            output_size,
         })
-    }
-
-    fn make_params(&self, base_seed: &[u8; 32], batch_id: u32) -> [u32; 76] {
-        let mut p = [0u32; 76];
-        for i in 0..8 {
-            p[i] = u32::from_le_bytes(base_seed[4 * i..4 * i + 4].try_into().unwrap());
-        }
-        p[8] = batch_id;
-        p[9] = self.threads;
-        p[12..28].copy_from_slice(&self.bx);
-        p[28..44].copy_from_slice(&self.by);
-        p[44..60].copy_from_slice(&self.bz);
-        p[60..76].copy_from_slice(&self.bt);
-        p
     }
 }
 
@@ -427,49 +388,61 @@ pub struct GpuKeyPair {
     pub scalar: [u8; 32],
 }
 
-/// One dispatch: produces `pipe.threads` keypairs from (base_seed, batch_id) and
-/// returns them parsed as (pubkey, scalar) pairs.
-pub fn keygen_dispatch(
+fn parse_pair(words: &[u32], off: usize) -> GpuKeyPair {
+    let mut pubkey = [0u8; 32];
+    let mut scalar = [0u8; 32];
+    for j in 0..8 {
+        pubkey[4 * j..4 * j + 4].copy_from_slice(&words[off + j].to_le_bytes());
+        scalar[4 * j..4 * j + 4].copy_from_slice(&words[off + 8 + j].to_le_bytes());
+    }
+    GpuKeyPair { pubkey, scalar }
+}
+
+/// Map a base32 pattern (lowercase alphabet) to its 5-bit symbol values for the
+/// on-device matcher. Returns None if any char is outside the base32 alphabet.
+fn pattern_to_symbols(pattern: &[u8]) -> Option<Vec<u32>> {
+    let alphabet = crate::crypto::VALID_CHARS.as_bytes();
+    pattern
+        .iter()
+        .map(|c| alphabet.iter().position(|a| a == c).map(|p| p as u32))
+        .collect()
+}
+
+/// One dispatch. In prefix mode the device compacts matches and we read back
+/// only the small header + matches region; in write-all mode every thread's
+/// keypair is read back by index.
+fn keygen_dispatch(
     ctx: &GpuContext,
     pipe: &KeygenPipeline,
     base_seed: &[u8; 32],
     batch_id: u32,
+    mode: u32,
+    pattern_syms: &[u32],
 ) -> Result<Vec<GpuKeyPair>> {
-    let params = pipe.make_params(base_seed, batch_id);
-    let params_buf = ctx
-        .device
-        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("keygen-params"),
-            contents: bytemuck::cast_slice(&params),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        });
-    let output_size = (pipe.threads as u64) * 16 * 4;
-    let output_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("keygen-output"),
-        size: output_size,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        mapped_at_creation: false,
-    });
-    let staging_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("keygen-staging"),
-        size: output_size,
-        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("keygen-bg"),
-        layout: &pipe.bgl,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: params_buf.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: output_buf.as_entire_binding(),
-            },
-        ],
-    });
+    let mut params = pipe.base_params;
+    for i in 0..8 {
+        params[i] = u32::from_le_bytes(base_seed[4 * i..4 * i + 4].try_into().unwrap());
+    }
+    params[8] = batch_id;
+    params[10] = mode;
+    if mode == MODE_PREFIX {
+        params[11] = pattern_syms.len() as u32;
+        params[76..76 + pattern_syms.len()].copy_from_slice(pattern_syms);
+    }
+    ctx.queue
+        .write_buffer(&pipe.params_buf, 0, bytemuck::cast_slice(&params));
+    // Reset the match counter before each prefix batch.
+    if mode == MODE_PREFIX {
+        ctx.queue.write_buffer(&pipe.output_buf, 0, &[0u8; 4]);
+    }
+
+    // Only read back what each mode produces.
+    let copy_size: u64 = if mode == MODE_PREFIX {
+        ((OUT_HEADER + MAX_MATCHES * 16) * 4) as u64
+    } else {
+        pipe.output_size
+    };
+
     let mut enc = ctx
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -480,14 +453,14 @@ pub fn keygen_dispatch(
             label: Some("keygen-pass"),
             timestamp_writes: None,
         });
-        cpass.set_pipeline(&pipe.pipeline);
-        cpass.set_bind_group(0, &bg, &[]);
+        cpass.set_pipeline(&pipe.main_pipeline);
+        cpass.set_bind_group(0, &pipe.bind_group, &[]);
         cpass.dispatch_workgroups(pipe.workgroups, 1, 1);
     }
-    enc.copy_buffer_to_buffer(&output_buf, 0, &staging_buf, 0, output_size);
+    enc.copy_buffer_to_buffer(&pipe.output_buf, 0, &pipe.staging_buf, 0, copy_size);
     ctx.queue.submit(Some(enc.finish()));
 
-    let slice = staging_buf.slice(..);
+    let slice = pipe.staging_buf.slice(..copy_size);
     let (tx, rx) = std::sync::mpsc::channel();
     slice.map_async(wgpu::MapMode::Read, move |r| {
         let _ = tx.send(r);
@@ -498,23 +471,25 @@ pub fn keygen_dispatch(
         .map_err(|e| anyhow!("map_async: {e:?}"))?;
     let raw = slice.get_mapped_range();
     let words: &[u32] = bytemuck::cast_slice(&raw);
-    let mut pairs = Vec::with_capacity(pipe.threads as usize);
-    for i in 0..pipe.threads as usize {
-        let off = i * 16;
-        let mut pubkey = [0u8; 32];
-        let mut scalar = [0u8; 32];
-        for j in 0..8 {
-            pubkey[4 * j..4 * j + 4].copy_from_slice(&words[off + j].to_le_bytes());
-            scalar[4 * j..4 * j + 4].copy_from_slice(&words[off + 8 + j].to_le_bytes());
-        }
-        pairs.push(GpuKeyPair { pubkey, scalar });
-    }
+
+    let pairs = if mode == MODE_PREFIX {
+        let count = (words[0] as usize).min(MAX_MATCHES);
+        (0..count)
+            .map(|i| parse_pair(words, OUT_HEADER + i * 16))
+            .collect()
+    } else {
+        (0..pipe.threads as usize)
+            .map(|i| parse_pair(words, i * 16))
+            .collect()
+    };
     drop(raw);
-    staging_buf.unmap();
+    pipe.staging_buf.unmap();
     Ok(pairs)
 }
 
-/// GPU search loop: dispatch batches until match or stop.
+/// GPU search loop: dispatch batches until match or stop. Prefix patterns short
+/// enough for the on-device matcher run in compaction mode (tiny readback);
+/// suffix/anywhere (and over-long prefixes) fall back to write-all + host scan.
 pub fn run_keygen(
     ctx: &GpuContext,
     pipe: &KeygenPipeline,
@@ -526,14 +501,35 @@ pub fn run_keygen(
 ) -> Result<()> {
     use crate::crypto::{MatchType, address_from_pubkey, check_prefix_fast};
     use rand::RngCore;
+
+    // Decide the dispatch mode once: on-device prefix matching when the pattern
+    // is a short enough prefix, otherwise write-all + host scan.
+    let device_prefix = matches!(match_type, MatchType::Prefix)
+        && pattern.len() <= MAX_DEVICE_PREFIX
+        && pattern_to_symbols(&pattern).is_some();
+    let (mode, pattern_syms) = if device_prefix {
+        (MODE_PREFIX, pattern_to_symbols(&pattern).unwrap())
+    } else {
+        (MODE_WRITE_ALL, Vec::new())
+    };
+
+    // Candidates produced per dispatch: prefix mode walks BATCH_K per thread.
+    let per_dispatch = if mode == MODE_PREFIX {
+        pipe.threads as u64 * BATCH_K as u64
+    } else {
+        pipe.threads as u64
+    };
+
     let mut rng = rand::thread_rng();
     let mut batch_id: u32 = 0;
     let mut base_seed = [0u8; 32];
     while !stop.load(Ordering::Relaxed) {
         rng.fill_bytes(&mut base_seed);
-        let pairs = keygen_dispatch(ctx, pipe, &base_seed, batch_id)?;
-        attempts.fetch_add(pipe.threads as u64, Ordering::Relaxed);
+        let pairs = keygen_dispatch(ctx, pipe, &base_seed, batch_id, mode, &pattern_syms)?;
+        attempts.fetch_add(per_dispatch, Ordering::Relaxed);
         for kp in &pairs {
+            // Re-verify on the host (device prefix candidates are double-checked;
+            // write-all pairs are scanned here).
             let matched = match match_type {
                 MatchType::Prefix => check_prefix_fast(&kp.pubkey, &pattern),
                 MatchType::Suffix => {
@@ -551,6 +547,34 @@ pub fn run_keygen(
                 return Ok(());
             }
         }
+        batch_id = batch_id.wrapping_add(1);
+    }
+    Ok(())
+}
+
+/// Benchmark real ed25519 keygen throughput for ~`target_secs`. Runs the same
+/// incremental prefix kernel the generator uses (with a representative prefix so
+/// the on-device match cost is included) and counts actual candidates produced.
+/// Matches are ignored - this measures generation rate, not search time, so the
+/// reported keys/s reflects what the GPU can really do.
+pub fn run_keygen_bench(
+    ctx: &GpuContext,
+    attempts: Arc<AtomicU64>,
+    stop: Arc<AtomicBool>,
+    target_secs: f64,
+) -> Result<()> {
+    use rand::RngCore;
+    let pipe = KeygenPipeline::new(ctx)?;
+    let pattern_syms = [0u32; 8]; // representative 8-char prefix; matches ignored
+    let per_dispatch = pipe.threads as u64 * BATCH_K as u64;
+    let mut rng = rand::thread_rng();
+    let mut base_seed = [0u8; 32];
+    let mut batch_id: u32 = 0;
+    let start = Instant::now();
+    while !stop.load(Ordering::Relaxed) && start.elapsed().as_secs_f64() < target_secs {
+        rng.fill_bytes(&mut base_seed);
+        keygen_dispatch(ctx, &pipe, &base_seed, batch_id, MODE_PREFIX, &pattern_syms)?;
+        attempts.fetch_add(per_dispatch, Ordering::Relaxed);
         batch_id = batch_id.wrapping_add(1);
     }
     Ok(())
@@ -601,7 +625,8 @@ mod tests {
         let pipe = KeygenPipeline::new(&ctx).expect("pipeline init");
         // Exercise a couple of batches/seeds so we cover varied scalars.
         for (base_seed, batch_id) in [([0u8; 32], 0u32), ([0x5Au8; 32], 7u32)] {
-            let pairs = keygen_dispatch(&ctx, &pipe, &base_seed, batch_id).expect("dispatch");
+            let pairs = keygen_dispatch(&ctx, &pipe, &base_seed, batch_id, MODE_WRITE_ALL, &[])
+                .expect("dispatch");
             for (i, kp) in pairs.iter().enumerate().step_by(101) {
                 let expected_scalar = derive_scalar_host(&base_seed, batch_id, i as u32);
                 assert_eq!(kp.scalar, expected_scalar, "thread {i}: scalar mismatch");
@@ -646,6 +671,15 @@ mod tests {
             addr.starts_with(pattern.as_slice()),
             "matched address {:?} does not start with pattern",
             std::str::from_utf8(&addr).unwrap()
+        );
+        // The incremental path returns scalar = s0 + j; verify it actually
+        // produces the matched pubkey (so the saved key is valid).
+        use curve25519_dalek::{edwards::EdwardsPoint, scalar::Scalar};
+        let s = Scalar::from_bytes_mod_order(kp.scalar);
+        assert_eq!(
+            EdwardsPoint::mul_base(&s).compress().0,
+            kp.pubkey,
+            "recovered scalar*B != matched pubkey"
         );
     }
 }

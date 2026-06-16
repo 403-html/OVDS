@@ -259,7 +259,7 @@ impl App {
         };
 
         let status_label = format!(
-            "Benchmarking GPU ({} · {}) - iterated SHA-256...",
+            "Benchmarking GPU ({} · {}) - ed25519 keygen...",
             gpu.backend_label(),
             gpu.adapter_name
         );
@@ -274,7 +274,7 @@ impl App {
             let error = Arc::clone(&w.error);
             // Isolate any wgpu panic (e.g. shader validation) from the TUI.
             let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                crate::gpu::run_bench(&gpu_thread, attempts, stop, 5.0)
+                crate::gpu::run_keygen_bench(&gpu_thread, attempts, stop, 5.0)
             }));
             match res {
                 Ok(Err(e)) => *error.lock().unwrap() = Some(format!("GPU error: {e}")),
@@ -502,7 +502,7 @@ impl App {
                             } else {
                                 self.gpu_benchmark_rate = Some(rate);
                                 self.status_msg =
-                                    format!("GPU benchmark done: {:.0} SHA-256/s", rate);
+                                    format!("GPU benchmark done: {:.0} keys/s", rate);
                             }
                         }
                     }
