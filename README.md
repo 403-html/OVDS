@@ -3,7 +3,7 @@
 Generate a custom `.onion` address for your Tor hidden service. Type a word, pick prefix/suffix/anywhere, and `ovds` searches all CPU cores until it finds a matching Ed25519 keypair.
 
 ```
- OVDS  onion vanity domain search                                      v0.4.0
+ OVDS  onion vanity domain search                                      v0.5.0
  mode  ›  estimate
 ┌ SEARCH ───────────────────────────────────────────────────────────────────────┐
 │                                                                               │
