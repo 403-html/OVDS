@@ -205,6 +205,12 @@ const COMB_WINDOWS: u32 = 32;
 const COMB_PTS_PER_WIN: u32 = 256;
 const GE_WORDS: u32 = 64;
 const TABLE_WORDS: u64 = (COMB_WINDOWS * COMB_PTS_PER_WIN * GE_WORDS) as u64;
+// y-only walk affine offsets (o+1)*B live right after the comb region: HALF =
+// BATCH_K/2 offsets, 3 field elements (x, y, x*y) = 48 words each. Mirrors
+// HALF / OFFSET_WORDS / OFFSETS_BASE in ed25519_keygen.wgsl.
+const OFFSETS_COUNT: u64 = (BATCH_K / 2) as u64;
+const OFFSET_WORDS: u64 = 48;
+const TABLE_TOTAL_WORDS: u64 = TABLE_WORDS + OFFSETS_COUNT * OFFSET_WORDS;
 const OUT_HEADER: usize = 4;
 const MAX_MATCHES: usize = 256;
 const PARAMS_WORDS: usize = 128;
@@ -299,7 +305,7 @@ impl KeygenPipeline {
             });
         let table_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("keygen-table"),
-            size: TABLE_WORDS * 4,
+            size: TABLE_TOTAL_WORDS * 4,
             usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
@@ -399,6 +405,17 @@ fn parse_pair(words: &[u32], off: usize) -> GpuKeyPair {
         scalar[4 * j..4 * j + 4].copy_from_slice(&words[off + 8 + j].to_le_bytes());
     }
     GpuKeyPair { pubkey, scalar }
+}
+
+/// Canonical compressed pubkey for a clamped ed25519 scalar. The y-only prefix/
+/// anywhere kernel emits a pubkey with the x-sign bit left 0 (it never computes
+/// x), so the host rebuilds the true pubkey from the scalar for matched candidates
+/// (cheap: only the rare on-device hits go through here).
+fn pubkey_from_scalar(scalar: &[u8; 32]) -> [u8; 32] {
+    use curve25519_dalek::{edwards::EdwardsPoint, scalar::Scalar};
+    EdwardsPoint::mul_base(&Scalar::from_bytes_mod_order(*scalar))
+        .compress()
+        .0
 }
 
 /// Map a base32 pattern (lowercase alphabet) to its 5-bit symbol values for the
@@ -553,10 +570,15 @@ pub fn run_keygen(
                 .find_any(|kp| host_match(&match_type, &pattern, kp))
                 .copied()
         } else {
-            pairs
-                .iter()
-                .find(|kp| host_match(&match_type, &pattern, kp))
-                .copied()
+            // Compaction (y-only) hits carry the correct scalar but a sign-bit-zero
+            // pubkey; rebuild the canonical pubkey from the scalar before verifying.
+            pairs.iter().find_map(|kp| {
+                let fixed = GpuKeyPair {
+                    pubkey: pubkey_from_scalar(&kp.scalar),
+                    scalar: kp.scalar,
+                };
+                host_match(&match_type, &pattern, &fixed).then_some(fixed)
+            })
         };
         if let Some(kp) = hit {
             *result.lock().unwrap() = Some(kp);
@@ -709,6 +731,42 @@ mod tests {
                     "candidate {i}: GPU pubkey != dalek scalar*B"
                 );
             }
+        }
+    }
+
+    /// Direct check of the y-only prefix kernel: dispatch MODE_PREFIX with a 1-char
+    /// pattern (~1/32 hit rate, so the batch returns many matches spanning both the
+    /// plus and minus scalar branches), then verify each device-emitted y-coordinate
+    /// equals dalek's y for the emitted scalar, and that the canonical address really
+    /// starts with the pattern (which also validates scalar_add/scalar_sub recovery).
+    #[test]
+    fn gpu_yonly_prefix_emits_correct_y() {
+        use curve25519_dalek::{edwards::EdwardsPoint, scalar::Scalar};
+
+        let Ok(ctx) = GpuContext::init() else {
+            eprintln!("skipping GPU test: no adapter");
+            return;
+        };
+        let pipe = KeygenPipeline::new(&ctx).expect("pipeline init");
+        let syms = pattern_to_symbols(b"a").unwrap();
+        let pairs =
+            keygen_dispatch(&ctx, &pipe, &[0x33u8; 32], 1, MODE_PREFIX, &syms).expect("dispatch");
+        assert!(!pairs.is_empty(), "expected on-device prefix 'a' hits");
+        for kp in &pairs {
+            let truth = EdwardsPoint::mul_base(&Scalar::from_bytes_mod_order(kp.scalar))
+                .compress()
+                .0;
+            let mut dev = kp.pubkey;
+            dev[31] &= 0x7F; // y-only leaves the x-sign bit 0
+            let mut want = truth;
+            want[31] &= 0x7F;
+            assert_eq!(
+                dev, want,
+                "device y-only != dalek y for scalar {:?}",
+                kp.scalar
+            );
+            let addr = crate::crypto::address_from_pubkey(&truth);
+            assert_eq!(addr[0], b'a', "device match but address lacks prefix 'a'");
         }
     }
 

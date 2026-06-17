@@ -11,6 +11,12 @@
 
 pub type Fe = [u32; 16];
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Counts fe_mul + fe_sq calls. Used by the y-only research measurement to give
+/// a deterministic field-multiply cost per candidate. Test-only.
+pub static FE_MUL_COUNT: AtomicU64 = AtomicU64::new(0);
+
 pub fn fe_zero() -> Fe {
     [0u32; 16]
 }
@@ -83,6 +89,7 @@ pub fn fe_carry(a: &Fe) -> Fe {
 }
 
 pub fn fe_mul(a: &Fe, b: &Fe) -> Fe {
+    FE_MUL_COUNT.fetch_add(1, Ordering::Relaxed);
     let mut t = [0u64; 31];
     for i in 0..16 {
         for j in 0..16 {
@@ -113,6 +120,7 @@ pub fn fe_mul(a: &Fe, b: &Fe) -> Fe {
 /// Dedicated squaring mirror: diagonal a_i^2 once, cross terms a_i*a_j (i<j)
 /// doubled. Mirrors the WGSL `fe_sq`; identical fold/pack tail to `fe_mul`.
 pub fn fe_sq(a: &Fe) -> Fe {
+    FE_MUL_COUNT.fetch_add(1, Ordering::Relaxed);
     let mut t = [0u64; 31];
     for i in 0..16 {
         t[i + i] += (a[i] as u64) * (a[i] as u64);
@@ -456,6 +464,167 @@ pub fn basepoint(bx: &[u8; 32], by: &[u8; 32]) -> Ge {
     let z = fe_one();
     let t = fe_from_bytes(&super::gpu::field_mul_p(bx, by));
     Ge { x, y, z, t }
+}
+
+// ---- affine y-only additive walk (research prototype; to be ported to WGSL) ----
+//
+// A Tor prefix depends only on the public key y-coordinate, so candidate x is
+// never needed. The d-independent dual addition formula (Hisil et al., eprint
+// 2008/522) gives the y of P+Q and P-Q from precomputed affine coords with only
+// adds, then all y = num/den are recovered with one batched inversion (Harris
+// vector division, eprint 2008/199). Amortized 5M+2A per candidate at large
+// batch; the single inversion still dominates at small K.
+
+#[derive(Clone)]
+pub struct Affine {
+    pub x: Fe,
+    pub y: Fe,
+    pub xy: Fe, // x*y, precomputed
+}
+
+pub fn affine_from_ge(p: &Ge) -> Affine {
+    let zinv = fe_invert(&p.z);
+    affine_from_ge_zinv(p, &zinv)
+}
+
+pub fn affine_from_ge_zinv(p: &Ge, zinv: &Fe) -> Affine {
+    let x = fe_mul(&p.x, zinv);
+    let y = fe_mul(&p.y, zinv);
+    let xy = fe_mul(&x, &y);
+    Affine { x, y, xy }
+}
+
+/// Simultaneous field division u[i] = x[i]/y[i] (Harris, eprint 2008/199): one
+/// inversion for the whole slice. 4(n-1)+1 muls + 1 invert.
+pub fn vector_division(x: &[Fe], y: &[Fe]) -> Vec<Fe> {
+    let n = x.len();
+    let mut u = vec![fe_zero(); n];
+    let mut py = y[0];
+    for i in 1..n {
+        u[i] = fe_mul(&py, &x[i]);
+        py = fe_mul(&py, &y[i]);
+    }
+    let mut py_inv = fe_invert(&py);
+    for i in (1..n).rev() {
+        u[i] = fe_mul(&py_inv, &u[i]);
+        py_inv = fe_mul(&py_inv, &y[i]);
+    }
+    u[0] = fe_mul(&py_inv, &x[0]);
+    u
+}
+
+/// y-only batch. Returns y-coordinates of {pa + offsets[j]} (indices 0..half)
+/// and {pa - offsets[j]} (indices half..2*half) via the dual addition formula
+/// plus one batched vector division. Mirrors onion-vanity-address search.go.
+pub fn batch_candidate_ys(pa: &Affine, offsets: &[Affine]) -> Vec<Fe> {
+    let half = offsets.len();
+    let n = 2 * half;
+    let mut ynum = vec![fe_zero(); n];
+    let mut yden = vec![fe_zero(); n];
+    for j in 0..half {
+        let off = &offsets[j];
+        let x1y2 = fe_mul(&pa.x, &off.y);
+        let y1x2 = fe_mul(&pa.y, &off.x);
+        // dual formula: y(P+Q) = (x1*y1 - x2*y2) / (x1*y2 - y1*x2)
+        ynum[j] = fe_sub(&pa.xy, &off.xy);
+        yden[j] = fe_sub(&x1y2, &y1x2);
+        // y(P-Q): -Q has y2'=y2, x2'=-x2, so x2*y2 -> -x2*y2 and y1*x2 -> -y1*x2
+        ynum[half + j] = fe_add(&pa.xy, &off.xy);
+        yden[half + j] = fe_add(&x1y2, &y1x2);
+    }
+    vector_division(&ynum, &yden)
+}
+
+/// Uniform left-fold division: out[i] = xnum[i]/yden[i] for the whole slice with
+/// one inversion, storing only 2 field elements per element (u and yden) - no
+/// special-cased index. This is the variant ported to the WGSL kernel (halves the
+/// per-candidate scratch vs storing X,Y,Z,prod). u[i] = (prod_{k<i} yden[k]) *
+/// xnum[i]; backward folds the suffix product into T so out[i] = u[i] * T.
+pub fn vector_division_leftfold(xnum: &[Fe], yden: &[Fe]) -> Vec<Fe> {
+    let n = xnum.len();
+    let mut u = vec![fe_zero(); n];
+    let mut py = fe_one();
+    for i in 0..n {
+        u[i] = fe_mul(&py, &xnum[i]);
+        py = fe_mul(&py, &yden[i]);
+    }
+    let mut t = fe_invert(&py);
+    let mut out = vec![fe_zero(); n];
+    for i in (0..n).rev() {
+        out[i] = fe_mul(&u[i], &t);
+        t = fe_mul(&t, &yden[i]);
+    }
+    out
+}
+
+/// y-only batch using the PROJECTIVE/extended center directly (no center affine
+/// inversion). This is the exact algorithm the WGSL kernel runs. For each affine
+/// offset Q=(o+1)*B, the d-independent dual formula gives the y of center +/- Q
+/// straight from (X1,Y1,Z1,T1): with x1=X1/Z1, y1=Y1/Z1 and T1=X1*Y1/Z1, the Z1
+/// factors cancel to
+///   y(center +/- Q) = (T1 -/+ Qxy*Z1) / (X1*Qy -/+ Y1*Qx).
+/// Then one left-fold division. Returns 2*half candidates interleaved:
+/// index 2*o = center + Q (scalar s0 + (o+1)), 2*o+1 = center - Q (s0 - (o+1)).
+pub fn batch_candidate_ys_proj(center: &Ge, offsets: &[Affine]) -> Vec<Fe> {
+    let half = offsets.len();
+    let n = 2 * half;
+    let mut xnum = vec![fe_zero(); n];
+    let mut yden = vec![fe_zero(); n];
+    for o in 0..half {
+        let off = &offsets[o];
+        let c = fe_mul(&off.xy, &center.z);
+        let a = fe_mul(&center.x, &off.y);
+        let b = fe_mul(&center.y, &off.x);
+        xnum[2 * o] = fe_sub(&center.t, &c); // plus
+        yden[2 * o] = fe_sub(&a, &b);
+        xnum[2 * o + 1] = fe_add(&center.t, &c); // minus
+        yden[2 * o + 1] = fe_add(&a, &b);
+    }
+    vector_division_leftfold(&xnum, &yden)
+}
+
+/// Montgomery batched inversion: invert all zs with one fe_invert.
+pub fn batch_invert(zs: &[Fe]) -> Vec<Fe> {
+    let n = zs.len();
+    let mut prefix = vec![fe_one(); n];
+    let mut acc = fe_one();
+    for i in 0..n {
+        prefix[i] = acc;
+        acc = fe_mul(&acc, &zs[i]);
+    }
+    let mut inv = fe_invert(&acc);
+    let mut out = vec![fe_zero(); n];
+    for i in (0..n).rev() {
+        out[i] = fe_mul(&prefix[i], &inv);
+        inv = fe_mul(&inv, &zs[i]);
+    }
+    out
+}
+
+/// Current GPU per-candidate algorithm (the "before"): incremental mixed-add
+/// walk storing X,Y,Z, then one batched inversion, then full compress (needs
+/// both x and y). Candidate i = p0 + i*B. Returns compressed pubkeys.
+pub fn batch_compress_current(p0: &Ge, b: &Ge, d_tb: &Fe, k: usize) -> Vec<[u8; 32]> {
+    let mut xs = Vec::with_capacity(k);
+    let mut ys = Vec::with_capacity(k);
+    let mut zs = Vec::with_capacity(k);
+    let mut p = p0.clone();
+    for _ in 0..k {
+        xs.push(p.x);
+        ys.push(p.y);
+        zs.push(p.z);
+        p = ge_add_mixed(&p, &b.x, &b.y, d_tb);
+    }
+    let zinvs = batch_invert(&zs);
+    let mut out = Vec::with_capacity(k);
+    for i in 0..k {
+        let x_aff = fe_mul(&xs[i], &zinvs[i]);
+        let y_aff = fe_mul(&ys[i], &zinvs[i]);
+        let mut bytes = fe_pack(&y_aff);
+        bytes[31] |= ((fe_freeze(&x_aff)[0] & 1) as u8) << 7;
+        out.push(bytes);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -908,6 +1077,179 @@ mod tests {
             let want = ref_mul(&ref_mul(&ab, &two), &ref_mul(&bb, &two));
             assert_eq!(got, want, "fe_mul unreduced seed {seed}");
         }
+    }
+
+    // ---- y-only additive walk ----
+
+    #[test]
+    fn vector_division_matches_naive() {
+        let mut xs = Vec::new();
+        let mut ys = Vec::new();
+        for seed in 0..20u64 {
+            xs.push(rand_reduced(seed).1);
+            ys.push(rand_reduced(seed.wrapping_add(500)).1);
+        }
+        let got = vector_division(&xs, &ys);
+        for i in 0..xs.len() {
+            let want = fe_mul(&xs[i], &fe_invert(&ys[i]));
+            assert_eq!(fe_pack(&got[i]), fe_pack(&want), "vec div idx {i}");
+        }
+    }
+
+    fn dalek_y(k: &Scalar) -> [u8; 32] {
+        let mut c = EdwardsPoint::mul_base(k).compress().0;
+        c[31] &= 0x7F; // strip x-sign; y-only
+        c
+    }
+
+    fn affine_offsets(bp: &Ge, half: usize) -> Vec<Affine> {
+        // offsets[j] = (j+1)*B in affine coords
+        let mut offsets = Vec::with_capacity(half);
+        let mut acc = bp.clone();
+        for _ in 0..half {
+            offsets.push(affine_from_ge(&acc));
+            acc = ge_add(&acc, bp);
+        }
+        offsets
+    }
+
+    #[test]
+    fn leftfold_division_matches() {
+        let mut xs = Vec::new();
+        let mut ys = Vec::new();
+        for seed in 0..40u64 {
+            xs.push(rand_reduced(seed).1);
+            ys.push(rand_reduced(seed.wrapping_add(900)).1);
+        }
+        let a = vector_division(&xs, &ys);
+        let b = vector_division_leftfold(&xs, &ys);
+        for i in 0..xs.len() {
+            assert_eq!(fe_pack(&a[i]), fe_pack(&b[i]), "leftfold vs harris idx {i}");
+        }
+    }
+
+    #[test]
+    fn y_only_proj_matches_dalek() {
+        // Exact kernel algorithm: projective/extended center + dual formula +
+        // left-fold division, validated against dalek for +/-32 offsets.
+        let bp = basepoint(&BX_LE, &BY_LE);
+        let half = 32usize;
+        let offsets = affine_offsets(&bp, half);
+        let s0: u64 = 1000;
+        let mut s0b = [0u8; 32];
+        s0b[..8].copy_from_slice(&s0.to_le_bytes());
+        let center = ge_scalarmult_base(&bp, &s0b);
+        let ys = batch_candidate_ys_proj(&center, &offsets);
+        let s0s = Scalar::from(s0);
+        for o in 0..half {
+            let m = Scalar::from((o as u64) + 1);
+            assert_eq!(
+                fe_pack(&ys[2 * o]),
+                dalek_y(&(s0s + m)),
+                "proj plus offset {}",
+                o + 1
+            );
+            assert_eq!(
+                fe_pack(&ys[2 * o + 1]),
+                dalek_y(&(s0s - m)),
+                "proj minus offset {}",
+                o + 1
+            );
+        }
+    }
+
+    #[test]
+    fn y_only_walk_matches_dalek() {
+        let bp = basepoint(&BX_LE, &BY_LE);
+        let half = 32usize;
+        let offsets = affine_offsets(&bp, half);
+        let s0: u64 = 1000;
+        let mut s0b = [0u8; 32];
+        s0b[..8].copy_from_slice(&s0.to_le_bytes());
+        let center = affine_from_ge(&ge_scalarmult_base(&bp, &s0b));
+        let ys = batch_candidate_ys(&center, &offsets);
+        let s0s = Scalar::from(s0);
+        for j in 0..half {
+            let m = Scalar::from((j as u64) + 1);
+            assert_eq!(
+                fe_pack(&ys[j]),
+                dalek_y(&(s0s + m)),
+                "y(P + {}B) mismatch",
+                j + 1
+            );
+            assert_eq!(
+                fe_pack(&ys[half + j]),
+                dalek_y(&(s0s - m)),
+                "y(P - {}B) mismatch",
+                j + 1
+            );
+        }
+    }
+
+    #[test]
+    fn y_only_matches_current_compress_low_bytes() {
+        // The y-only path must agree with the full-compress path on all bytes
+        // except the x-sign bit (byte 31, bit 7), which y-only does not set.
+        let bp = basepoint(&BX_LE, &BY_LE);
+        let d_tb = fe_mul(&bp.t, &d_const());
+        let s0: u64 = 555;
+        let mut s0b = [0u8; 32];
+        s0b[..8].copy_from_slice(&s0.to_le_bytes());
+        let center_ge = ge_scalarmult_base(&bp, &s0b);
+        let cur = batch_compress_current(&center_ge, &bp, &d_tb, 9);
+        let half = 8usize;
+        let offsets = affine_offsets(&bp, half);
+        let center_aff = affine_from_ge(&center_ge);
+        let ys = batch_candidate_ys(&center_aff, &offsets);
+        for j in 0..half {
+            let mut want = cur[j + 1]; // current candidate at offset (j+1)*B
+            want[31] &= 0x7F;
+            assert_eq!(fe_pack(&ys[j]), want, "y-only vs current at +{}B", j + 1);
+        }
+    }
+
+    #[test]
+    #[ignore = "measurement: cargo test --release -- fe16_ref::tests::measure_y_only_vs_current --ignored --nocapture"]
+    fn measure_y_only_vs_current() {
+        let bp = basepoint(&BX_LE, &BY_LE);
+        let d_tb = fe_mul(&bp.t, &d_const());
+        let k = 64usize;
+        let half = k / 2;
+        let s0: u64 = 777;
+        let mut s0b = [0u8; 32];
+        s0b[..8].copy_from_slice(&s0.to_le_bytes());
+        let center_ge = ge_scalarmult_base(&bp, &s0b);
+        let center_aff = affine_from_ge(&center_ge);
+        let offsets = affine_offsets(&bp, half);
+
+        // BEFORE: current GPU per-candidate algorithm.
+        FE_MUL_COUNT.store(0, Ordering::Relaxed);
+        let t0 = std::time::Instant::now();
+        let _ = batch_compress_current(&center_ge, &bp, &d_tb, k);
+        let before_t = t0.elapsed();
+        let before = FE_MUL_COUNT.load(Ordering::Relaxed);
+
+        // AFTER: y-only walk (excludes the once-per-batch center advance, ~0.2/cand).
+        FE_MUL_COUNT.store(0, Ordering::Relaxed);
+        let t1 = std::time::Instant::now();
+        let _ = batch_candidate_ys(&center_aff, &offsets);
+        let after_t = t1.elapsed();
+        let after = FE_MUL_COUNT.load(Ordering::Relaxed);
+
+        let bpc = before as f64 / k as f64;
+        let apc = after as f64 / k as f64;
+        eprintln!("--- y-only vs current, K={k} (mul+sq per candidate) ---");
+        eprintln!("BEFORE current: {before} total, {bpc:.2}/cand, {before_t:?}");
+        eprintln!("AFTER  y-only : {after} total, {apc:.2}/cand, {after_t:?}");
+        eprintln!("measured: {:.2}x fewer field muls/candidate", bpc / apc);
+        // Project the large-batch asymptote: one inversion (~265 muls) amortized away.
+        let inv = 265.0;
+        let before_asym = (before as f64 - inv) / k as f64;
+        let after_asym = (after as f64 - inv) / k as f64;
+        eprintln!(
+            "asymptotic (inv amortized): before {before_asym:.2}/cand, after {after_asym:.2}/cand, {:.2}x",
+            before_asym / after_asym
+        );
     }
 
     #[test]

@@ -44,6 +44,7 @@ cargo test --release -- bench::keygen_throughput --ignored --nocapture
 | v0.3.0  | 0.67M | 11.96M | real ed25519 keygen in WGSL: incremental walk + batched Montgomery inversion (BATCH_K=64) |
 | v0.4.0  | 0.70M | 11.91M | on-device anywhere + fast suffix path (features; prefix throughput unchanged) |
 | v0.5.0  | 0.69M | 12.86M | mixed-base walk add, coalesced scratch, dedicated `fe_sq` (~7-8% over v0.4.0) |
+| v0.6.0  | 0.68M | 19.65M | y-only walk for prefix/anywhere (dual-addition + left-fold division); 1.53x over v0.5.0 |
 
 - CPU is flat at ~0.70M every version (the primitive never changed; 0.67M at
   v0.3.0 is run-to-run noise).
@@ -51,6 +52,11 @@ cargo test --release -- bench::keygen_throughput --ignored --nocapture
   tag itself already ships the batched walk and measures ~11.96M.
 - v0.5.0's lift came from arithmetic/memory work informed by gECC (see
   References); the earlier contended ~7.1M is superseded by this idle run.
+- v0.6.0 computes only the candidate y-coordinate (all a Tor prefix needs):
+  ~5 field muls/candidate vs ~13, and half the scratch. End-to-end 1.53x rather
+  than the ~1.9x mul ratio because the per-thread comb (P0 = s0*B) is shared by
+  both paths. Suffix is unchanged (write-all still needs the x-sign bit). From
+  AlexanderYastrebov's onion-vanity-address (see References).
 - Single machine (M3 Pro / Metal); the version-over-version shape is the point.
   Suffix mode reads back all candidates for a host scan, so its rate is lower and
   not in this table.
@@ -61,3 +67,6 @@ cargo test --release -- bench::keygen_throughput --ignored --nocapture
 - cathugger, "mkp224o," https://github.com/cathugger/mkp224o. Reference CPU Tor
   v3 generator; same additive-walk + batched-inversion algorithm OVDS runs on the
   GPU.
+- A. Yastrebov, "onion-vanity-address," https://github.com/AlexanderYastrebov/onion-vanity-address.
+  Source of the y-only walk (dual addition formula, eprint 2008/522; simultaneous
+  field division, eprint 2008/199) that OVDS v0.6.0 ports to the GPU.
