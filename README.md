@@ -60,7 +60,7 @@ Each character multiplies the expected search time by 32 (base32 alphabet size):
 | 6 chars       | 1B            | ~30 min              |
 | 7 chars       | 34B           | ~19 hr               |
 
-Run `[b]` inside the app to benchmark your hardware first.
+Run `[b]` inside the app to benchmark your hardware first. See [BENCHMARKS.md](BENCHMARKS.md) for GPU throughput across versions and how to measure it.
 
 ## Keybinds
 
