@@ -129,6 +129,13 @@ impl MatchType {
 pub const VALID_CHARS: &str = "abcdefghijklmnopqrstuvwxyz234567";
 pub const ADDRESS_LEN: usize = 56;
 
+/// Number of leading address chars the GPU on-device matcher can scan (the pubkey
+/// region). Mirrors `MAX_DEVICE_PREFIX` in ed25519_keygen.wgsl. Anywhere matches
+/// in the tail (checksum/version) require host SHA3 and are only found by the
+/// CPU / write-all paths, so the GPU anywhere search effectively scans this many
+/// chars, not the full ADDRESS_LEN.
+pub const MAX_DEVICE_PREFIX: usize = 48;
+
 pub fn validate_pattern(s: &str) -> (bool, Vec<usize>) {
     let invalid: Vec<usize> = s
         .chars()

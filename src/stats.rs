@@ -1,7 +1,12 @@
-use crate::crypto::{ADDRESS_LEN, MatchType};
+use crate::crypto::{Backend, MatchType, ADDRESS_LEN, MAX_DEVICE_PREFIX};
 
 /// Probability of a single keypair matching the pattern.
-pub fn match_probability(pattern_len: usize, match_type: &MatchType) -> f64 {
+///
+/// `Anywhere` is backend-dependent: the GPU on-device matcher only scans the
+/// pubkey region (first `MAX_DEVICE_PREFIX` chars), so it has fewer start
+/// positions than the CPU / write-all paths, which scan the full address. Using
+/// the full address for a GPU anywhere search would make the ETA optimistic.
+pub fn match_probability(pattern_len: usize, match_type: &MatchType, backend: &Backend) -> f64 {
     if pattern_len == 0 {
         return 1.0;
     }
@@ -9,8 +14,14 @@ pub fn match_probability(pattern_len: usize, match_type: &MatchType) -> f64 {
     match match_type {
         MatchType::Prefix | MatchType::Suffix => p_single,
         MatchType::Anywhere => {
-            // number of positions the pattern can start at
-            let positions = ADDRESS_LEN.saturating_sub(pattern_len) + 1;
+            // Chars actually scanned. GPU on-device matcher is capped at
+            // MAX_DEVICE_PREFIX; longer patterns there fall back to write-all
+            // (full address), as does the CPU backend.
+            let window = match backend {
+                Backend::Gpu if pattern_len <= MAX_DEVICE_PREFIX => MAX_DEVICE_PREFIX,
+                _ => ADDRESS_LEN,
+            };
+            let positions = window.saturating_sub(pattern_len) + 1;
             // union-bound approximation (good for small p)
             (positions as f64 * p_single).min(1.0)
         }
@@ -19,7 +30,11 @@ pub fn match_probability(pattern_len: usize, match_type: &MatchType) -> f64 {
 
 /// Expected keypairs needed (mean of geometric distribution).
 pub fn expected_attempts(p: f64) -> f64 {
-    if p <= 0.0 { f64::INFINITY } else { 1.0 / p }
+    if p <= 0.0 {
+        f64::INFINITY
+    } else {
+        1.0 / p
+    }
 }
 
 /// Quantile of geometric distribution: smallest n such that CDF(n) >= q.
@@ -106,12 +121,12 @@ pub fn format_rate(kps: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::{ADDRESS_LEN, MatchType};
+    use crate::crypto::{Backend, MatchType, ADDRESS_LEN, MAX_DEVICE_PREFIX};
 
     #[test]
     fn quantile_no_underflow_for_long_patterns() {
         // 11-char prefix: p = 1/32^11 = 1/2^55 ≈ 2.78e-17 < f64 epsilon → was broken
-        let p = match_probability(11, &MatchType::Prefix);
+        let p = match_probability(11, &MatchType::Prefix, &Backend::Cpu);
         let q50 = quantile_attempts(p, 0.50);
         assert!(
             q50.is_finite() && q50 > 1e15,
@@ -120,7 +135,7 @@ mod tests {
         );
 
         // 20-char prefix: p = 1/32^20, astronomically small
-        let p20 = match_probability(20, &MatchType::Prefix);
+        let p20 = match_probability(20, &MatchType::Prefix, &Backend::Cpu);
         let q01 = quantile_attempts(p20, 0.01);
         assert!(
             q01.is_finite(),
@@ -179,22 +194,48 @@ mod tests {
 
     #[test]
     fn match_probability_scales_with_length() {
-        let p3 = match_probability(3, &MatchType::Prefix);
-        let p4 = match_probability(4, &MatchType::Prefix);
+        let p3 = match_probability(3, &MatchType::Prefix, &Backend::Cpu);
+        let p4 = match_probability(4, &MatchType::Prefix, &Backend::Cpu);
         // each char divides probability by 32
         assert!((p3 / p4 - 32.0).abs() < 1e-12);
-        assert_eq!(match_probability(0, &MatchType::Prefix), 1.0);
+        assert_eq!(match_probability(0, &MatchType::Prefix, &Backend::Cpu), 1.0);
     }
 
     #[test]
     fn match_probability_anywhere_uses_positions() {
-        // anywhere uses (positions * p_single), capped at 1.0
-        let p_single = match_probability(3, &MatchType::Prefix);
-        let p_any = match_probability(3, &MatchType::Anywhere);
+        // CPU anywhere scans the full address: positions = ADDRESS_LEN - len + 1.
+        let p_single = match_probability(3, &MatchType::Prefix, &Backend::Cpu);
+        let p_any = match_probability(3, &MatchType::Anywhere, &Backend::Cpu);
         let positions = ADDRESS_LEN - 3 + 1;
         assert!((p_any - (positions as f64 * p_single)).abs() < 1e-15);
         // very short pattern saturates to 1.0
-        assert_eq!(match_probability(0, &MatchType::Anywhere), 1.0);
+        assert_eq!(
+            match_probability(0, &MatchType::Anywhere, &Backend::Cpu),
+            1.0
+        );
+    }
+
+    #[test]
+    fn match_probability_anywhere_gpu_window_is_smaller() {
+        // GPU on-device matcher scans only MAX_DEVICE_PREFIX chars, so it has
+        // fewer start positions than CPU -> lower probability, higher ETA.
+        let p_single = match_probability(3, &MatchType::Prefix, &Backend::Gpu);
+        let p_gpu = match_probability(3, &MatchType::Anywhere, &Backend::Gpu);
+        let positions = MAX_DEVICE_PREFIX - 3 + 1;
+        assert!((p_gpu - (positions as f64 * p_single)).abs() < 1e-15);
+        // GPU anywhere must be strictly less likely than CPU anywhere (8 fewer chars)
+        let p_cpu = match_probability(3, &MatchType::Anywhere, &Backend::Cpu);
+        assert!(
+            p_gpu < p_cpu,
+            "GPU window must yield lower p ({p_gpu} vs {p_cpu})"
+        );
+        // A pattern longer than the device window falls back to full-address scan.
+        let p_long_gpu = match_probability(50, &MatchType::Anywhere, &Backend::Gpu);
+        let p_long_cpu = match_probability(50, &MatchType::Anywhere, &Backend::Cpu);
+        assert_eq!(
+            p_long_gpu, p_long_cpu,
+            "len > MAX_DEVICE_PREFIX uses full address"
+        );
     }
 
     #[test]

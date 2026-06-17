@@ -346,7 +346,7 @@ fn draw_prob_panel(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let p = match_probability(app.pattern.len(), &app.match_type);
+    let p = match_probability(app.pattern.len(), &app.match_type, &app.backend);
     let exp = expected_attempts(p);
 
     let lines = vec![
@@ -459,7 +459,6 @@ fn draw_time_panel(f: &mut Frame, app: &App, area: Rect) {
     let gpu_available = app.gpu.is_some();
     for mt in [MatchType::Prefix, MatchType::Suffix, MatchType::Anywhere] {
         let is_current_mt = mt == app.match_type;
-        let p = match_probability(app.pattern.len(), &mt);
 
         let name_col = format!("{}{}", mt.label().to_uppercase(), if is_current_mt { " ▸" } else { "" });
         lines.push(Line::from(vec![
@@ -479,6 +478,7 @@ fn draw_time_panel(f: &mut Frame, app: &App, area: Rect) {
             let col = if active { OK } else { DIM };
             match app.benchmarks.get(&(backend, mt.clone())).copied() {
                 Some(rate) => {
+                    let p = match_probability(app.pattern.len(), &mt, &backend);
                     let p50 = format_duration(quantile_attempts(p, 0.50) / rate);
                     let p95 = format_duration(quantile_attempts(p, 0.95) / rate);
                     lines.push(Line::from(vec![
@@ -717,7 +717,7 @@ fn draw_generate_status(
     };
 
     let elapsed = started.elapsed();
-    let p = match_probability(app.pattern.len(), &app.match_type);
+    let p = match_probability(app.pattern.len(), &app.match_type, &backend);
     let progress = cdf(attempts, p);
 
     let (eta_p50, eta_p95) = if rate > 0.0 {

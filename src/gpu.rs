@@ -210,7 +210,7 @@ const MAX_MATCHES: usize = 256;
 const PARAMS_WORDS: usize = 128;
 /// Longest prefix the on-device base32 match supports: char j reads bytes
 /// `5j/8` and `5j/8 + 1`, so j <= 47 keeps both bytes within the 32-byte pubkey.
-const MAX_DEVICE_PREFIX: usize = 48;
+use crate::crypto::MAX_DEVICE_PREFIX;
 
 pub struct KeygenPipeline {
     main_pipeline: wgpu::ComputePipeline,
