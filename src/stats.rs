@@ -1,4 +1,4 @@
-use crate::crypto::{Backend, MatchType, ADDRESS_LEN, MAX_DEVICE_PREFIX};
+use crate::crypto::{ADDRESS_LEN, Backend, MAX_DEVICE_PREFIX, MatchType};
 
 /// Probability of a single keypair matching the pattern.
 ///
@@ -30,11 +30,7 @@ pub fn match_probability(pattern_len: usize, match_type: &MatchType, backend: &B
 
 /// Expected keypairs needed (mean of geometric distribution).
 pub fn expected_attempts(p: f64) -> f64 {
-    if p <= 0.0 {
-        f64::INFINITY
-    } else {
-        1.0 / p
-    }
+    if p <= 0.0 { f64::INFINITY } else { 1.0 / p }
 }
 
 /// Quantile of geometric distribution: smallest n such that CDF(n) >= q.
@@ -121,7 +117,7 @@ pub fn format_rate(kps: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::{Backend, MatchType, ADDRESS_LEN, MAX_DEVICE_PREFIX};
+    use crate::crypto::{ADDRESS_LEN, Backend, MAX_DEVICE_PREFIX, MatchType};
 
     #[test]
     fn quantile_no_underflow_for_long_patterns() {

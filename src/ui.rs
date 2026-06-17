@@ -460,7 +460,11 @@ fn draw_time_panel(f: &mut Frame, app: &App, area: Rect) {
     for mt in [MatchType::Prefix, MatchType::Suffix, MatchType::Anywhere] {
         let is_current_mt = mt == app.match_type;
 
-        let name_col = format!("{}{}", mt.label().to_uppercase(), if is_current_mt { " ▸" } else { "" });
+        let name_col = format!(
+            "{}{}",
+            mt.label().to_uppercase(),
+            if is_current_mt { " ▸" } else { "" }
+        );
         lines.push(Line::from(vec![
             Span::styled(
                 format!("  {:<15}", name_col),
@@ -804,8 +808,14 @@ fn draw_generate_status(
                 .style(Style::default().fg(DIM))
                 .bounds([y_min, y_max])
                 .labels(vec![
-                    Span::styled(format!("{}/s", format_count(y_min)), Style::default().fg(DIM)),
-                    Span::styled(format!("{}/s", format_count(y_max)), Style::default().fg(DIM)),
+                    Span::styled(
+                        format!("{}/s", format_count(y_min)),
+                        Style::default().fg(DIM),
+                    ),
+                    Span::styled(
+                        format!("{}/s", format_count(y_max)),
+                        Style::default().fg(DIM),
+                    ),
                 ]),
         );
     f.render_widget(chart, chart_area);

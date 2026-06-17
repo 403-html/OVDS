@@ -10,7 +10,7 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::gpu::{bench_dispatch_rate, GpuContext};
+    use crate::gpu::{GpuContext, bench_dispatch_rate};
 
     #[test]
     #[ignore]
