@@ -608,6 +608,31 @@ pub fn run_keygen_bench(
     Ok(())
 }
 
+/// Raw keygen-dispatch throughput (keys/s) over `runs` rounds of `n` dispatches
+/// each, on an already-built pipeline so the comb-table build and PSO compile are
+/// excluded from timing. Returns one keys/s sample per round (take the median;
+/// expect noise when the GPU is shared). Prefix mode + a never-matching pattern,
+/// so it measures pure generation. Drives the ignored `bench` throughput test;
+/// not on the UI path. Lives here to reach the crate-private dispatch internals.
+#[cfg(test)]
+pub(crate) fn bench_dispatch_rate(ctx: &GpuContext, runs: u32, n: u32) -> Result<Vec<f64>> {
+    let pipe = KeygenPipeline::new(ctx)?;
+    let syms = pattern_to_symbols(b"ovdsbench42").unwrap();
+    let per = pipe.threads as u64 * BATCH_K as u64;
+    keygen_dispatch(ctx, &pipe, &[0u8; 32], 0, MODE_PREFIX, &syms)?; // warm up
+    let mut samples = Vec::with_capacity(runs as usize);
+    for run in 0..runs {
+        let start = Instant::now();
+        for b in 0..n {
+            let seed = [(run as u8).wrapping_add(b as u8); 32];
+            keygen_dispatch(ctx, &pipe, &seed, b, MODE_PREFIX, &syms)?;
+        }
+        let secs = start.elapsed().as_secs_f64();
+        samples.push((per * n as u64) as f64 / secs);
+    }
+    Ok(samples)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

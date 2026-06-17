@@ -1,4 +1,6 @@
 mod app;
+#[cfg(test)]
+mod bench;
 mod crypto;
 #[cfg(test)]
 mod fe16_ref;
