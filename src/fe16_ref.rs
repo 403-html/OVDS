@@ -374,6 +374,29 @@ pub fn ge_double(p: &Ge) -> Ge {
     ge_add(p, p)
 }
 
+/// Mixed addition mirror: q is affine (z = 1), supplied as (qx, qy, q_dt) with
+/// q_dt = d * qx * qy precomputed. Same unified/complete formula as ge_add with
+/// z_q = 1 (d = z_p, no multiply) and d folded into q_dt. 8 muls vs 10.
+pub fn ge_add_mixed(p: &Ge, qx: &Fe, qy: &Fe, q_dt: &Fe) -> Ge {
+    let a = fe_mul(&p.x, qx);
+    let b = fe_mul(&p.y, qy);
+    let c = fe_mul(&p.t, q_dt);
+    let d = p.z; // z_q = 1
+    let e = fe_sub(
+        &fe_sub(&fe_mul(&fe_add(&p.x, &p.y), &fe_add(qx, qy)), &a),
+        &b,
+    );
+    let f = fe_sub(&d, &c);
+    let g = fe_add(&d, &c);
+    let h = fe_add(&b, &a); // H = B - a*A = B + A  (a = -1)
+    Ge {
+        x: fe_mul(&e, &f),
+        y: fe_mul(&g, &h),
+        z: fe_mul(&f, &g),
+        t: fe_mul(&e, &h),
+    }
+}
+
 pub fn ge_scalarmult_base(b: &Ge, scalar: &[u8; 32]) -> Ge {
     // scalar as 8 LE u32
     let s: [u32; 8] =
@@ -606,6 +629,25 @@ mod tests {
         let three_b = ge_add(&ge_double(&bp), &bp);
         let expected = EdwardsPoint::mul_base(&Scalar::from(3u64)).compress().0;
         assert_eq!(ge_compress(&three_b), expected, "3B mismatch");
+    }
+
+    #[test]
+    fn ge_add_mixed_matches_full_add_and_dalek() {
+        // The walk step P + B done with the mixed add must equal the full ge_add
+        // and dalek for every step. dTb = d * T_B.
+        let bp = basepoint(&BX_LE, &BY_LE);
+        let d_tb = fe_mul(&bp.t, &d_const());
+        let mut p_full = basepoint(&BX_LE, &BY_LE);
+        let mut p_mixed = basepoint(&BX_LE, &BY_LE);
+        for k in 2u64..=20 {
+            p_full = ge_add(&p_full, &bp);
+            p_mixed = ge_add_mixed(&p_mixed, &bp.x, &bp.y, &d_tb);
+            let c_full = ge_compress(&p_full);
+            let c_mixed = ge_compress(&p_mixed);
+            assert_eq!(c_mixed, c_full, "mixed != full at {k}B");
+            let expected = EdwardsPoint::mul_base(&Scalar::from(k)).compress().0;
+            assert_eq!(c_mixed, expected, "mixed {k}B mismatch vs dalek");
+        }
     }
 
     #[test]

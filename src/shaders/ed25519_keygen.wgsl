@@ -363,6 +363,28 @@ fn ge_double(p: Ge) -> Ge {
     return ge_add(p, p);
 }
 
+// Mixed addition: q is an affine point (Z = 1) supplied as (qx, qy, q_dt) where
+// q_dt = d * T_q = d * qx * qy is precomputed once. Same unified/complete formula
+// as ge_add with Z_q = 1 substituted (so D = Z_p, no multiply) and d folded into
+// q_dt (so C = T_p * q_dt). 8 fe_mul instead of 10 - used for the P + B walk step
+// where B is the fixed basepoint. Still complete (identical values to ge_add).
+fn ge_add_mixed(p: Ge, qx: array<u32, 16>, qy: array<u32, 16>, q_dt: array<u32, 16>) -> Ge {
+    let A = fe_mul(p.X, qx);
+    let B = fe_mul(p.Y, qy);
+    let C = fe_mul(p.T, q_dt);
+    let D = p.Z; // Z_q = 1
+    let E = fe_sub(fe_sub(fe_mul(fe_add(p.X, p.Y), fe_add(qx, qy)), A), B);
+    let F = fe_sub(D, C);
+    let G = fe_add(D, C);
+    let H = fe_add(B, A); // H = B - a*A = B + A  (a = -1)
+    var r: Ge;
+    r.X = fe_mul(E, F);
+    r.Y = fe_mul(G, H);
+    r.Z = fe_mul(F, G);
+    r.T = fe_mul(E, H);
+    return r;
+}
+
 // --- comb table storage ---
 
 fn store_ge(slot: u32, g: Ge) {
@@ -509,14 +531,18 @@ fn write_record(o: u32, pubkey: array<u32, 8>, scalar: array<u32, 8>) {
 
 // --- incremental batch helpers ---
 
-fn scratch_store_fe(off: u32, v: array<u32, 16>) {
+// Scratch is laid out [candidate][word][thread] so that the thread index is the
+// innermost (stride-1) dimension: a warp's consecutive threads then touch
+// contiguous global-memory words for the same (candidate, word), giving coalesced
+// access. `base` already folds in the thread index; `stride` is the thread count.
+fn scratch_store_fe(base: u32, stride: u32, v: array<u32, 16>) {
     var vv = v;
-    for (var i = 0u; i < 16u; i = i + 1u) { scratch[off + i] = vv[i]; }
+    for (var i = 0u; i < 16u; i = i + 1u) { scratch[base + i * stride] = vv[i]; }
 }
 
-fn scratch_load_fe(off: u32) -> array<u32, 16> {
+fn scratch_load_fe(base: u32, stride: u32) -> array<u32, 16> {
     var r: array<u32, 16>;
-    for (var i = 0u; i < 16u; i = i + 1u) { r[i] = scratch[off + i]; }
+    for (var i = 0u; i < 16u; i = i + 1u) { r[i] = scratch[base + i * stride]; }
     return r;
 }
 
@@ -583,19 +609,23 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // (Montgomery's trick). Prefix/anywhere match on-device and compact; write-all
     // emits every candidate keypair for the host to scan.
     var P = comb_scalarmult(s0); // P0 = s0 * B (projective)
-    let sbase = idx * BATCH_K * SCRATCH_WORDS_PER;
+    // Coalesced scratch layout [candidate][word][thread]: thread index is innermost
+    // (stride-1), so a warp's threads write contiguous words. cbase(j) below is the
+    // word-0 address for this thread's candidate j; field elements are offset by
+    // 16*threads each, and limbs within a field element are strided by `threads`.
+    let dTb = fe_mul(B.T, D_CONST); // d * T_B, precomputed once for the mixed add
 
     // Forward pass: emit P0, P0+B, ... storing (X,Y,Z) and the running product
     // of Z values so each 1/Z_j can be recovered after a single inversion.
     var acc = fe_one();
     for (var j = 0u; j < BATCH_K; j = j + 1u) {
-        let o = sbase + j * SCRATCH_WORDS_PER;
-        scratch_store_fe(o, P.X);
-        scratch_store_fe(o + 16u, P.Y);
-        scratch_store_fe(o + 32u, P.Z);
-        scratch_store_fe(o + 48u, acc); // prefix product before folding in Z_j
+        let cbase = (j * SCRATCH_WORDS_PER) * threads + idx;
+        scratch_store_fe(cbase, threads, P.X);
+        scratch_store_fe(cbase + 16u * threads, threads, P.Y);
+        scratch_store_fe(cbase + 32u * threads, threads, P.Z);
+        scratch_store_fe(cbase + 48u * threads, threads, acc); // prefix product before folding in Z_j
         acc = fe_mul(acc, P.Z);
-        P = ge_add(P, B);
+        P = ge_add_mixed(P, B.X, B.Y, dTb);
     }
 
     // One inversion for the whole batch.
@@ -604,12 +634,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Backward pass: 1/Z_j = inv * prefix_j, then strip Z_j out of inv.
     for (var jj = 0u; jj < BATCH_K; jj = jj + 1u) {
         let j = BATCH_K - 1u - jj;
-        let o = sbase + j * SCRATCH_WORDS_PER;
-        let zj = scratch_load_fe(o + 32u);
-        let pre = scratch_load_fe(o + 48u);
+        let cbase = (j * SCRATCH_WORDS_PER) * threads + idx;
+        let zj = scratch_load_fe(cbase + 32u * threads, threads);
+        let pre = scratch_load_fe(cbase + 48u * threads, threads);
         let zinv = fe_mul(inv, pre);
         inv = fe_mul(inv, zj);
-        let pubkey = compress_zinv(scratch_load_fe(o), scratch_load_fe(o + 16u), zinv);
+        let pubkey = compress_zinv(scratch_load_fe(cbase, threads), scratch_load_fe(cbase + 16u * threads, threads), zinv);
 
         if (mode == 1u) {
             // Write-all: emit every candidate keypair by flat index; host scans.
