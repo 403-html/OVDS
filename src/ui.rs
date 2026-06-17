@@ -2,12 +2,13 @@ use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
+    symbols,
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Gauge, Paragraph, Sparkline, Wrap},
+    widgets::{Axis, Block, Borders, Chart, Dataset, Gauge, GraphType, Paragraph, Wrap},
 };
 
 use crate::app::{App, FocusedPanel, Mode};
-use crate::crypto::{ADDRESS_LEN, Backend, validate_pattern};
+use crate::crypto::{ADDRESS_LEN, Backend, MatchType, validate_pattern};
 use crate::stats::{
     cdf, expected_attempts, format_count, format_duration, format_rate, match_probability,
     quantile_attempts,
@@ -94,7 +95,7 @@ fn draw_body(f: &mut Frame, app: &App, area: Rect) {
         .constraints([
             Constraint::Length(9),  // search (full width)
             Constraint::Min(0),     // probability + time estimates
-            Constraint::Length(10), // status / actions
+            Constraint::Length(12), // status / actions
         ])
         .split(area);
 
@@ -441,112 +442,67 @@ fn draw_time_panel(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let p = match_probability(app.pattern.len(), &app.match_type);
-
-    // Transposed table: rows = quantiles, columns = rates
-    let quantiles: &[(f64, &str)] = &[
-        (0.01, "p1"),
-        (0.10, "p10"),
-        (0.25, "p25"),
-        (0.50, "p50"),
-        (0.75, "p75"),
-        (0.95, "p95"),
-        (0.99, "p99"),
-    ];
-
-    let ref_rates: &[(&str, f64)] = &[("100K/s", 100_000.0), ("1M/s", 1_000_000.0)];
-
-    // Header: blank label col + ref columns + CPU + GPU
-    let sep = "  ─────────────────────────────────────────────────────────";
-
-    let mut header_spans = vec![Span::styled(
-        format!("  {:<5}", ""),
+    // One block per match type, each listing CPU and GPU p50/p95. Every block
+    // uses its own probability (anywhere is likelier than prefix/suffix) and the
+    // per-(backend, match type) rate cached this session, so all measured combos
+    // are visible at once, not just the current mode.
+    let mut lines: Vec<Line> = vec![Line::from(Span::styled(
+        format!(
+            "  {} · {} char{}",
+            app.pattern,
+            app.pattern.len(),
+            if app.pattern.len() == 1 { "" } else { "s" }
+        ),
         Style::default().fg(DIM),
-    )];
-    for (label, _) in ref_rates {
-        header_spans.push(Span::styled(
-            format!("{:<11}", label),
-            Style::default().fg(DIM),
-        ));
-    }
-    // CPU column
-    let cpu_active = matches!(app.backend, Backend::Cpu);
-    if let Some(rate) = app.cpu_rate_for_current() {
-        header_spans.push(Span::styled(
-            format!("{:<13}", format!("CPU {}", format_rate(rate))),
-            Style::default()
-                .fg(if cpu_active { OK } else { DIM })
-                .add_modifier(Modifier::BOLD),
-        ));
-    } else {
-        header_spans.push(Span::styled(
-            format!("{:<13}", "CPU [b]"),
-            Style::default().fg(DIM).add_modifier(Modifier::ITALIC),
-        ));
-    }
-    // GPU column
-    let gpu_active = matches!(app.backend, Backend::Gpu);
-    if let Some(rate) = app.gpu_rate_for_current() {
-        header_spans.push(Span::styled(
-            format!("GPU {}", format_rate(rate)),
-            Style::default()
-                .fg(if gpu_active { OK } else { DIM })
-                .add_modifier(Modifier::BOLD),
-        ));
-    } else if app.gpu.is_some() {
-        header_spans.push(Span::styled(
-            "GPU [c,b]",
-            Style::default().fg(DIM).add_modifier(Modifier::ITALIC),
-        ));
-    } else {
-        header_spans.push(Span::styled(
-            "GPU n/a",
-            Style::default().fg(DIM).add_modifier(Modifier::ITALIC),
-        ));
-    }
+    ))];
 
-    let mut lines = vec![
-        Line::raw(""),
-        Line::from(header_spans),
-        Line::from(Span::styled(sep, Style::default().fg(DIM))),
-    ];
+    let gpu_available = app.gpu.is_some();
+    for mt in [MatchType::Prefix, MatchType::Suffix, MatchType::Anywhere] {
+        let is_current_mt = mt == app.match_type;
+        let p = match_probability(app.pattern.len(), &mt);
 
-    for (q, label) in quantiles {
-        let mut spans = vec![Span::styled(
-            format!("  {:<5}", label),
-            Style::default().fg(DIM),
-        )];
-        for (_, rate) in ref_rates {
-            let secs = quantile_attempts(p, *q) / rate;
-            spans.push(Span::styled(
-                format!("{:<11}", format_duration(secs)),
-                Style::default().fg(DIM),
-            ));
+        let name_col = format!("{}{}", mt.label().to_uppercase(), if is_current_mt { " ▸" } else { "" });
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {:<15}", name_col),
+                Style::default()
+                    .fg(if is_current_mt { ACCENT } else { BRIGHT })
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("{:<10}", "p50"), Style::default().fg(DIM)),
+            Span::styled("p95", Style::default().fg(DIM)),
+        ]));
+
+        for backend in [Backend::Cpu, Backend::Gpu] {
+            let label = backend.label();
+            let active = is_current_mt && backend == app.backend;
+            let col = if active { OK } else { DIM };
+            match app.benchmarks.get(&(backend, mt.clone())).copied() {
+                Some(rate) => {
+                    let p50 = format_duration(quantile_attempts(p, 0.50) / rate);
+                    let p95 = format_duration(quantile_attempts(p, 0.95) / rate);
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            format!("    {:<4}{:<9}", label, format_rate(rate)),
+                            Style::default().fg(col),
+                        ),
+                        Span::styled(format!("{:<10}", p50), Style::default().fg(col)),
+                        Span::styled(p95, Style::default().fg(col)),
+                    ]));
+                }
+                None => {
+                    let note = if backend == Backend::Gpu && !gpu_available {
+                        "n/a"
+                    } else {
+                        "[b]"
+                    };
+                    lines.push(Line::from(Span::styled(
+                        format!("    {:<4}{}", label, note),
+                        Style::default().fg(DIM).add_modifier(Modifier::ITALIC),
+                    )));
+                }
+            }
         }
-        // CPU column
-        if let Some(rate) = app.cpu_rate_for_current() {
-            let secs = quantile_attempts(p, *q) / rate;
-            spans.push(Span::styled(
-                format!("{:<13}", format_duration(secs)),
-                Style::default().fg(if cpu_active { OK } else { DIM }),
-            ));
-        } else {
-            spans.push(Span::styled(
-                format!("{:<13}", "-"),
-                Style::default().fg(DIM),
-            ));
-        }
-        // GPU column
-        if let Some(rate) = app.gpu_rate_for_current() {
-            let secs = quantile_attempts(p, *q) / rate;
-            spans.push(Span::styled(
-                format_duration(secs),
-                Style::default().fg(if gpu_active { OK } else { DIM }),
-            ));
-        } else {
-            spans.push(Span::styled("-", Style::default().fg(DIM)));
-        }
-        lines.push(Line::from(spans));
     }
 
     f.render_widget(Paragraph::new(Text::from(lines)), inner);
@@ -772,88 +728,160 @@ fn draw_generate_status(
         ("…".into(), "…".into())
     };
 
-    // layout (8 inner lines):
-    //  0  empty
-    //  1  tries / rate
-    //  2  elapsed / ETA p50 / p95
-    //  3  "throughput history" label
-    //  4  sparkline
-    //  5  progress gauge
-    //  6  [s] stop
-    //  7  empty
+    let peak = history.iter().copied().max().unwrap_or(0) as f64;
 
-    let spark_area = Rect {
-        x: inner.x + 2,
-        y: inner.y + 4,
-        width: inner.width.saturating_sub(4),
-        height: 1,
+    // Chart + rail on top, then the gauge and the stop hint. A 1-col margin plus
+    // blank rows between sections give the panel breathing room, and the gauge row
+    // is split so the percentage has its own column instead of camping on the bar.
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .horizontal_margin(1)
+        .constraints([
+            Constraint::Min(3),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    let top = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Min(20),
+            Constraint::Length(2),
+            Constraint::Length(24),
+        ])
+        .split(rows[0]);
+    let chart_area = top[0];
+    let rail_area = top[2];
+    let gauge_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(16),
+            Constraint::Length(1),
+            Constraint::Min(10),
+        ])
+        .split(rows[2]);
+    let pct_area = gauge_cols[0];
+    let bar_area = gauge_cols[2];
+    let stop_area = rows[4];
+
+    // The line is scaled to the plot rect, so it fills the full width regardless
+    // of how many samples exist (this is what fixes the sparkline under-fill).
+    let data: Vec<(f64, f64)> = history
+        .iter()
+        .enumerate()
+        .map(|(i, &r)| (i as f64, r as f64))
+        .collect();
+    let x_max = history.len().saturating_sub(1).max(1) as f64;
+    // Zoom Y to the data range (not 0..peak) so a stable rate centers in the plot
+    // and small fluctuations stay visible instead of a flat line pinned to the top.
+    let lo = history.iter().copied().min().unwrap_or(0) as f64;
+    let (y_min, y_max) = if peak > 0.0 {
+        ((lo * 0.9).max(0.0), peak * 1.1)
+    } else {
+        (0.0, 1.0)
     };
-    let gauge_area = Rect {
-        x: inner.x + 2,
-        y: inner.y + 5,
-        width: inner.width.saturating_sub(4),
-        height: 1,
-    };
-
-    f.render_widget(
-        Paragraph::new(Text::from(vec![
-            Line::from(vec![
-                Span::styled("  backend  ", Style::default().fg(DIM)),
-                Span::styled(
-                    backend_detail,
-                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled("  tries    ", Style::default().fg(DIM)),
-                Span::styled(
-                    format_count(attempts as f64),
-                    Style::default().fg(BRIGHT).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled("    rate  ", Style::default().fg(DIM)),
-                Span::styled(format_rate(rate), Style::default().fg(BRIGHT)),
-            ]),
-            Line::from(vec![
-                Span::styled("  elapsed  ", Style::default().fg(DIM)),
-                Span::styled(
-                    format_duration(elapsed.as_secs_f64()),
-                    Style::default().fg(BRIGHT),
-                ),
-                Span::styled("    ETA p50  ", Style::default().fg(DIM)),
-                Span::styled(eta_p50, Style::default().fg(OK)),
-                Span::styled("    p95  ", Style::default().fg(DIM)),
-                Span::styled(eta_p95, Style::default().fg(WARN)),
-            ]),
-            Line::from(Span::styled(
-                "  throughput history",
-                Style::default().fg(DIM),
-            )),
-            Line::raw(""), // sparkline
-            Line::raw(""), // gauge
-            Line::from(Span::styled("  [s] stop", Style::default().fg(DIM))),
-            Line::raw(""),
-        ])),
-        inner,
-    );
-
-    if !history.is_empty() {
-        f.render_widget(
-            Sparkline::default()
-                .data(history)
-                .style(Style::default().fg(ACCENT)),
-            spark_area,
+    let datasets = vec![
+        Dataset::default()
+            .marker(symbols::Marker::Braille)
+            .graph_type(GraphType::Line)
+            .style(Style::default().fg(ACCENT))
+            .data(&data),
+    ];
+    let chart = Chart::new(datasets)
+        .x_axis(
+            Axis::default()
+                .style(Style::default().fg(DIM))
+                .bounds([0.0, x_max])
+                .labels(vec![
+                    Span::styled(format!("-{}s", history.len()), Style::default().fg(DIM)),
+                    Span::styled("now", Style::default().fg(DIM)),
+                ]),
+        )
+        .y_axis(
+            Axis::default()
+                .style(Style::default().fg(DIM))
+                .bounds([y_min, y_max])
+                .labels(vec![
+                    Span::styled(format!("{}/s", format_count(y_min)), Style::default().fg(DIM)),
+                    Span::styled(format!("{}/s", format_count(y_max)), Style::default().fg(DIM)),
+                ]),
         );
-    }
+    f.render_widget(chart, chart_area);
 
+    let label = |s: &str| Span::styled(format!("  {:<8}", s), Style::default().fg(DIM));
+    let rail = Paragraph::new(Text::from(vec![
+        Line::from(Span::styled(
+            backend_detail,
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(vec![
+            label("tries"),
+            Span::styled(
+                format_count(attempts as f64),
+                Style::default().fg(BRIGHT).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            label("rate"),
+            Span::styled(format_rate(rate), Style::default().fg(BRIGHT)),
+        ]),
+        Line::from(vec![
+            label("elapsed"),
+            Span::styled(
+                format_duration(elapsed.as_secs_f64()),
+                Style::default().fg(BRIGHT),
+            ),
+        ]),
+        Line::from(vec![
+            label("ETA"),
+            Span::styled(eta_p50, Style::default().fg(OK)),
+            Span::styled(" · ", Style::default().fg(DIM)),
+            Span::styled(eta_p95, Style::default().fg(WARN)),
+        ]),
+    ]));
+    f.render_widget(rail, rail_area);
+
+    // Percentage in its own column; the bar is a separate rect so nothing overlaps.
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("covered ", Style::default().fg(DIM)),
+            Span::styled(
+                format!("{:.2}%", progress * 100.0),
+                Style::default().fg(BRIGHT).add_modifier(Modifier::BOLD),
+            ),
+        ])),
+        pct_area,
+    );
     f.render_widget(
         Gauge::default()
             .gauge_style(Style::default().fg(ACCENT).bg(Color::Black))
             .ratio(progress)
-            .label(format!(
-                " {:.1}% probability mass covered ",
-                progress * 100.0
-            )),
-        gauge_area,
+            .label(""),
+        bar_area,
+    );
+    // p50 / p95 markers at fixed points of the covered axis: once the fill passes
+    // the green tick you are past the median run, past the yellow one you are in
+    // the unlucky 5%.
+    for (frac, col) in [(0.50_f64, OK), (0.95_f64, WARN)] {
+        let tx = bar_area.x + (bar_area.width as f64 * frac) as u16;
+        if tx < bar_area.x + bar_area.width {
+            f.render_widget(
+                Paragraph::new(Span::styled("┊", Style::default().fg(col))),
+                Rect {
+                    x: tx,
+                    y: bar_area.y,
+                    width: 1,
+                    height: 1,
+                },
+            );
+        }
+    }
+
+    f.render_widget(
+        Paragraph::new(Span::styled("[s] stop", Style::default().fg(DIM))),
+        stop_area,
     );
 }
 

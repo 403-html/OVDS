@@ -71,7 +71,7 @@ pub fn check_prefix_fast(pubkey: &[u8; 32], pattern: &[u8]) -> bool {
     enc[..n] == *pattern
 }
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Backend {
     Cpu,
     Gpu,
@@ -93,7 +93,7 @@ impl Backend {
     }
 }
 
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum MatchType {
     Prefix,
     Suffix,

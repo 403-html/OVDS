@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -127,11 +127,11 @@ pub struct App {
     pub pattern: String,
     pub match_type: MatchType,
     pub mode: Mode,
-    /// Last benchmark rate per backend, tagged with the match type it was measured
-    /// under so the estimate panel never pairs (say) a prefix rate with a suffix
-    /// probability. Use `cpu_rate_for_current` / `gpu_rate_for_current` to read.
-    pub cpu_benchmark: Option<(MatchType, f64)>,
-    pub gpu_benchmark: Option<(MatchType, f64)>,
+    /// Benchmark rate (keys/s) per (backend, match type) measured this session, so
+    /// the estimate panel never pairs (say) a prefix rate with a suffix probability
+    /// and switching backend/mode never drops an already-measured number. In-memory
+    /// only; cleared on exit.
+    pub benchmarks: HashMap<(Backend, MatchType), f64>,
     pub threads: usize,
     pub backend: Backend,
     pub gpu: Option<Arc<GpuContext>>,
@@ -151,8 +151,7 @@ impl App {
             pattern: String::new(),
             match_type: MatchType::Prefix,
             mode: Mode::Idle,
-            cpu_benchmark: None,
-            gpu_benchmark: None,
+            benchmarks: HashMap::new(),
             threads: rayon::current_num_threads(),
             backend: Backend::Cpu,
             gpu,
@@ -188,18 +187,6 @@ impl App {
     /// Benchmark rate for the CPU backend, but only if it was measured under the
     /// currently selected match type (rates differ per mode, so a mismatch would
     /// give a misleading ETA).
-    pub fn cpu_rate_for_current(&self) -> Option<f64> {
-        self.cpu_benchmark
-            .as_ref()
-            .and_then(|(mt, r)| (*mt == self.match_type).then_some(*r))
-    }
-
-    pub fn gpu_rate_for_current(&self) -> Option<f64> {
-        self.gpu_benchmark
-            .as_ref()
-            .and_then(|(mt, r)| (*mt == self.match_type).then_some(*r))
-    }
-
     pub fn pattern_valid(&self) -> bool {
         !self.pattern.is_empty()
             && self
@@ -540,7 +527,8 @@ impl App {
                     let measured = match_type.clone();
                     match backend {
                         Backend::Cpu => {
-                            self.cpu_benchmark = Some((measured.clone(), rate));
+                            self.benchmarks
+                                .insert((Backend::Cpu, measured.clone()), rate);
                             self.status_msg = format!(
                                 "CPU benchmark done ({}): {:.0} keys/s on {} threads",
                                 measured.label(),
@@ -552,7 +540,8 @@ impl App {
                             if let Some(e) = err {
                                 self.status_msg = e;
                             } else {
-                                self.gpu_benchmark = Some((measured.clone(), rate));
+                                self.benchmarks
+                                    .insert((Backend::Gpu, measured.clone()), rate);
                                 self.status_msg = format!(
                                     "GPU benchmark done ({}): {:.0} keys/s",
                                     measured.label(),
