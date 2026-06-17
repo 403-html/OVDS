@@ -222,11 +222,6 @@ fn fe_mul(a: array<u32, 16>, b: array<u32, 16>) -> array<u32, 16> {
 // partial products vs 256 for the general multiply. The doubled cross terms
 // (< 2^33) and per-column sums (< 2^36, same bound as fe_mul) stay in the vec2
 // accumulators, so the fold/pack/carry tail is identical to fe_mul.
-// Dedicated squaring: each cross product a_i*a_j (i != j) appears twice in a*a,
-// so compute it once and double it; only the diagonal a_i^2 is unique. ~136
-// partial products vs 256 for the general multiply. The doubled cross terms
-// (< 2^33) and per-column sums (< 2^36, same bound as fe_mul) stay in the vec2
-// accumulators, so the fold/pack/carry tail is identical to fe_mul.
 fn fe_sq(a: array<u32, 16>) -> array<u32, 16> {
     var aa = a;
     var t: array<vec2<u32>, 31>;

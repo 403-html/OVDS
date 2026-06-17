@@ -184,9 +184,6 @@ impl App {
         self.focused_panel = self.focused_panel.toggle();
     }
 
-    /// Benchmark rate for the CPU backend, but only if it was measured under the
-    /// currently selected match type (rates differ per mode, so a mismatch would
-    /// give a misleading ETA).
     pub fn pattern_valid(&self) -> bool {
         !self.pattern.is_empty()
             && self
