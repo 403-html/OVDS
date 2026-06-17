@@ -13,6 +13,9 @@ pub struct WorkerState {
     pub stop: Arc<AtomicBool>,
     pub result: Arc<Mutex<Option<FoundResult>>>,
     pub error: Arc<Mutex<Option<String>>>,
+    /// Steady-state keys/s reported by a GPU benchmark (excludes pipeline build +
+    /// warm-up). Preferred over attempts/wall-elapsed, which includes that startup.
+    pub bench_rate: Arc<Mutex<Option<f64>>>,
 }
 
 impl WorkerState {
@@ -22,6 +25,7 @@ impl WorkerState {
             stop: Arc::new(AtomicBool::new(false)),
             result: Arc::new(Mutex::new(None)),
             error: Arc::new(Mutex::new(None)),
+            bench_rate: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -305,7 +309,8 @@ impl App {
             let error = Arc::clone(&w.error);
             // Isolate any wgpu panic (e.g. shader validation) from the TUI.
             let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                crate::gpu::run_keygen_bench(&gpu_thread, mt_thread, attempts, stop, 5.0)
+                let rate_out = Arc::clone(&w.bench_rate);
+                crate::gpu::run_keygen_bench(&gpu_thread, mt_thread, attempts, stop, rate_out, 5.0)
             }));
             match res {
                 Ok(Err(e)) => *error.lock().unwrap() = Some(format!("GPU error: {e}")),
@@ -537,12 +542,16 @@ impl App {
                             if let Some(e) = err {
                                 self.status_msg = e;
                             } else {
+                                // Prefer the steady-state rate the bench measured
+                                // (build + warm-up excluded); fall back to the cold
+                                // attempts/elapsed average only if it is missing.
+                                let gpu_rate = worker.bench_rate.lock().unwrap().unwrap_or(rate);
                                 self.benchmarks
-                                    .insert((Backend::Gpu, measured.clone()), rate);
+                                    .insert((Backend::Gpu, measured.clone()), gpu_rate);
                                 self.status_msg = format!(
                                     "GPU benchmark done ({}): {:.0} keys/s",
                                     measured.label(),
-                                    rate
+                                    gpu_rate
                                 );
                             }
                         }

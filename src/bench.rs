@@ -58,6 +58,38 @@ mod tests {
         v[v.len() / 2]
     }
 
+    /// The in-app GPU benchmark path (run_keygen_bench) must report a steady-state
+    /// rate close to bench_dispatch_rate - i.e. it excludes pipeline build + warm-up.
+    /// Guards the fix where the app divided attempts by a wall clock that included
+    /// startup and under-reported (~14M vs ~19M).
+    #[test]
+    #[ignore]
+    fn app_gpu_bench_rate() {
+        use crate::crypto::MatchType;
+        use crate::gpu::run_keygen_bench;
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+        use std::sync::{Arc, Mutex};
+
+        let Ok(ctx) = GpuContext::init() else {
+            eprintln!("APP-BENCH gpu = n/a (no adapter)");
+            return;
+        };
+        let attempts = Arc::new(AtomicU64::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let rate = Arc::new(Mutex::new(None));
+        run_keygen_bench(
+            &ctx,
+            MatchType::Prefix,
+            attempts,
+            stop,
+            Arc::clone(&rate),
+            5.0,
+        )
+        .expect("bench");
+        let r = rate.lock().unwrap().expect("rate reported");
+        eprintln!("APP-BENCH gpu = {:.3}M keys/s", r / 1e6);
+    }
+
     #[test]
     #[ignore]
     fn keygen_throughput() {

@@ -596,11 +596,17 @@ pub fn run_keygen(
 /// scan; prefix/anywhere include the on-device match). A long representative
 /// pattern keeps the search from short-circuiting during the window; matches are
 /// ignored - this measures generation rate, not search time.
+///
+/// Reports the steady-state rate via `rate_out`: the pipeline build and the first
+/// (PSO-compiling) dispatch are excluded, and timing covers only the productive
+/// loop. The caller's wall clock includes build + warm-up, so dividing its attempt
+/// counter by elapsed undercounts; use `rate_out` for the figure.
 pub fn run_keygen_bench(
     ctx: &GpuContext,
     match_type: crate::crypto::MatchType,
     attempts: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
+    rate_out: Arc<Mutex<Option<f64>>>,
     target_secs: f64,
 ) -> Result<()> {
     use rand::RngCore;
@@ -612,10 +618,9 @@ pub fn run_keygen_bench(
     let mut rng = rand::thread_rng();
     let mut base_seed = [0u8; 32];
     let mut batch_id: u32 = 0;
-    let start = Instant::now();
-    while !stop.load(Ordering::Relaxed) && start.elapsed().as_secs_f64() < target_secs {
-        rng.fill_bytes(&mut base_seed);
-        let pairs = keygen_dispatch(ctx, &pipe, &base_seed, batch_id, mode, &pattern_syms)?;
+
+    let run_one = |seed: &[u8; 32], bid: u32| -> Result<()> {
+        let pairs = keygen_dispatch(ctx, &pipe, seed, bid, mode, &pattern_syms)?;
         // Write-all measures generation plus the parallel host scan it really does.
         if mode == MODE_WRITE_ALL {
             let _ = std::hint::black_box(
@@ -624,9 +629,28 @@ pub fn run_keygen_bench(
                     .any(|kp| host_match(&match_type, &pattern, kp)),
             );
         }
+        Ok(())
+    };
+
+    // Warm-up: the first dispatch pays lazy PSO compilation. Excluding it (and the
+    // pipeline build above) is what separates steady-state keys/s from a cold
+    // average - mirrors bench_dispatch_rate so the in-app number matches the docs.
+    rng.fill_bytes(&mut base_seed);
+    run_one(&base_seed, batch_id)?;
+    batch_id = batch_id.wrapping_add(1);
+
+    // Time only the productive window.
+    let mut produced: u64 = 0;
+    let start = Instant::now();
+    while !stop.load(Ordering::Relaxed) && start.elapsed().as_secs_f64() < target_secs {
+        rng.fill_bytes(&mut base_seed);
+        run_one(&base_seed, batch_id)?;
+        produced += per_dispatch;
         attempts.fetch_add(per_dispatch, Ordering::Relaxed);
         batch_id = batch_id.wrapping_add(1);
     }
+    let secs = start.elapsed().as_secs_f64().max(1e-6);
+    *rate_out.lock().unwrap() = Some(produced as f64 / secs);
     Ok(())
 }
 
