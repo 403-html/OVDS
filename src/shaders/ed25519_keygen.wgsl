@@ -217,8 +217,54 @@ fn fe_mul(a: array<u32, 16>, b: array<u32, 16>) -> array<u32, 16> {
     return fe_carry(r);
 }
 
+// Dedicated squaring: each cross product a_i*a_j (i != j) appears twice in a*a,
+// so compute it once and double it; only the diagonal a_i^2 is unique. ~136
+// partial products vs 256 for the general multiply. The doubled cross terms
+// (< 2^33) and per-column sums (< 2^36, same bound as fe_mul) stay in the vec2
+// accumulators, so the fold/pack/carry tail is identical to fe_mul.
+// Dedicated squaring: each cross product a_i*a_j (i != j) appears twice in a*a,
+// so compute it once and double it; only the diagonal a_i^2 is unique. ~136
+// partial products vs 256 for the general multiply. The doubled cross terms
+// (< 2^33) and per-column sums (< 2^36, same bound as fe_mul) stay in the vec2
+// accumulators, so the fold/pack/carry tail is identical to fe_mul.
 fn fe_sq(a: array<u32, 16>) -> array<u32, 16> {
-    return fe_mul(a, a);
+    var aa = a;
+    var t: array<vec2<u32>, 31>;
+    for (var i = 0u; i < 31u; i = i + 1u) { t[i] = u64_zero(); }
+
+    for (var i = 0u; i < 16u; i = i + 1u) {
+        t[i + i] = u64_add(t[i + i], u64_mul(aa[i], aa[i])); // diagonal a_i^2
+        for (var j = i + 1u; j < 16u; j = j + 1u) {
+            let p = u64_mul(aa[i], aa[j]);
+            t[i + j] = u64_add(t[i + j], u64_add(p, p)); // 2 * a_i * a_j
+        }
+    }
+
+    // Fold high half into low half via *38, then pack with carry propagation.
+    // (Identical tail to fe_mul.)
+    for (var i = 0u; i < 15u; i = i + 1u) {
+        let hi = t[i + 16u];
+        let lo_part = u64_mul(38u, hi.x);
+        let hi_shift = vec2<u32>(0u, 38u * hi.y);
+        t[i] = u64_add(t[i], u64_add(lo_part, hi_shift));
+    }
+
+    var r: array<u32, 16>;
+    var carry_lo: u32 = 0u;
+    var carry_hi: u32 = 0u;
+    for (var i = 0u; i < 16u; i = i + 1u) {
+        var v = u64_add_u32(t[i], carry_lo);
+        v = vec2<u32>(v.x, v.y + carry_hi);
+        r[i] = v.x & 0xFFFFu;
+        carry_lo = (v.x >> 16u) | (v.y << 16u);
+        carry_hi = v.y >> 16u;
+    }
+    let prod = u64_mul(38u, carry_lo);
+    let r0_new = r[0] + prod.x;
+    let r0_carry = u32(r0_new < r[0]);
+    r[0] = r0_new;
+    r[1] = r[1] + prod.y + r0_carry;
+    return fe_carry(r);
 }
 
 // Inversion via Fermat: a^(p-2) where p-2 = 2^255 - 21.

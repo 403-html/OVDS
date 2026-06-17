@@ -110,8 +110,34 @@ pub fn fe_mul(a: &Fe, b: &Fe) -> Fe {
     fe_carry(&r)
 }
 
+/// Dedicated squaring mirror: diagonal a_i^2 once, cross terms a_i*a_j (i<j)
+/// doubled. Mirrors the WGSL `fe_sq`; identical fold/pack tail to `fe_mul`.
 pub fn fe_sq(a: &Fe) -> Fe {
-    fe_mul(a, a)
+    let mut t = [0u64; 31];
+    for i in 0..16 {
+        t[i + i] += (a[i] as u64) * (a[i] as u64);
+        for j in (i + 1)..16 {
+            t[i + j] += 2 * (a[i] as u64) * (a[j] as u64);
+        }
+    }
+    for i in 0..15 {
+        t[i] += 38 * t[i + 16];
+    }
+    let mut r = [0u32; 16];
+    let mut carry: u64 = 0;
+    for i in 0..16 {
+        let v = t[i] + carry;
+        r[i] = (v & 0xFFFF) as u32;
+        carry = v >> 16;
+    }
+    let prod = 38u64 * carry;
+    let r0_new = r[0] as u64 + (prod & 0xFFFFFFFF);
+    r[0] = (r0_new & 0xFFFFFFFF) as u32;
+    let r0_carry = (r0_new >> 32) as u32;
+    r[1] = r[1]
+        .wrapping_add((prod >> 32) as u32)
+        .wrapping_add(r0_carry);
+    fe_carry(&r)
 }
 
 pub fn fe_invert(z: &Fe) -> Fe {
@@ -881,6 +907,23 @@ mod tests {
             };
             let want = ref_mul(&ref_mul(&ab, &two), &ref_mul(&bb, &two));
             assert_eq!(got, want, "fe_mul unreduced seed {seed}");
+        }
+    }
+
+    #[test]
+    fn fe_sq_matches_mul() {
+        // The dedicated squaring sums the same products as a*a (cross terms
+        // doubled), through the identical fold/pack tail, so it must produce
+        // bit-identical limbs to fe_mul(a, a) for reduced and unreduced inputs.
+        for seed in 0..100 {
+            let (_, a) = rand_reduced(seed);
+            assert_eq!(fe_sq(&a), fe_mul(&a, &a), "fe_sq reduced seed {seed}");
+            let asum = fe_add(&a, &a); // 2a, unreduced (limbs ~2^17)
+            assert_eq!(
+                fe_sq(&asum),
+                fe_mul(&asum, &asum),
+                "fe_sq unreduced seed {seed}"
+            );
         }
     }
 }
