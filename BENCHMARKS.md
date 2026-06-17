@@ -57,9 +57,7 @@ cargo test --release -- bench::keygen_throughput --ignored --nocapture
 
 ## References
 
-- Qian Xiong, Weiliang Ma, Xuanhua Shi, Yongruan Zhou, Hai Jin, Kaiyi Huang,
-  Haozhou Wang, and Zhengru Wang. "gECC: A GPU-based High-Throughput Framework
-  for Elliptic Curve Cryptography." arXiv:2501.03245, 2025.
+- Q. Xiong, W. Ma, X. Shi, Y. Zhou, H. Jin, K. Huang, H. Wang, and Z. Wang, "gECC: A GPU-based high-throughput framework for Elliptic Curve Cryptography," 2024, arXiv:2501.03245.
 - cathugger, "mkp224o," https://github.com/cathugger/mkp224o. Reference CPU Tor
   v3 generator; same additive-walk + batched-inversion algorithm OVDS runs on the
   GPU.
