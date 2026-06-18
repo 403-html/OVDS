@@ -77,9 +77,11 @@ mod tests {
         let attempts = Arc::new(AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));
         let rate = Arc::new(Mutex::new(None));
+        let batch_k = crate::gpu::default_batch_k(&ctx.limits);
         run_keygen_bench(
             &ctx,
             MatchType::Prefix,
+            batch_k,
             attempts,
             stop,
             Arc::clone(&rate),
@@ -98,11 +100,16 @@ mod tests {
 
         match GpuContext::init() {
             Ok(ctx) => {
-                let samples = bench_dispatch_rate(&ctx, 5, 40).expect("bench");
-                for s in &samples {
-                    eprintln!("BENCH gpu sample = {:.3}M keys/s", s / 1e6);
+                // Sweep the device-bounded BATCH_K options so this doubles as a
+                // check that runtime K selection actually scales throughput.
+                let max_k = crate::gpu::max_batch_k(&ctx.limits);
+                for k in [64u32, 128, 256, 512].into_iter().filter(|&k| k <= max_k) {
+                    let samples = bench_dispatch_rate(&ctx, k, 5, 40).expect("bench");
+                    eprintln!(
+                        "BENCH gpu K={k:<4} = {:.3}M keys/s (median)",
+                        median(samples) / 1e6
+                    );
                 }
-                eprintln!("BENCH gpu = {:.3}M keys/s (median)", median(samples) / 1e6);
             }
             Err(_) => eprintln!("BENCH gpu = n/a (no adapter)"),
         }

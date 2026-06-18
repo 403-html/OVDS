@@ -26,6 +26,9 @@ pub struct GpuContext {
     pub queue: wgpu::Queue,
     pub adapter_name: String,
     pub backend: wgpu::Backend,
+    /// Device limits, kept so the app can size BATCH_K to what the GPU can
+    /// actually allocate (max_buffer_size / max_storage_buffer_binding_size).
+    pub limits: wgpu::Limits,
 }
 
 impl GpuContext {
@@ -53,14 +56,15 @@ impl GpuContext {
         let backend = info.backend;
 
         // The incremental keygen needs a large scratch buffer (one binding holds
-        // threads * BATCH_K points), well past downlevel defaults, so request the
+        // threads * batch_k points), well past downlevel defaults, so request the
         // adapter's real limits.
+        let limits = adapter.limits();
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("ovds-gpu"),
                     required_features: wgpu::Features::empty(),
-                    required_limits: adapter.limits(),
+                    required_limits: limits.clone(),
                     memory_hints: wgpu::MemoryHints::Performance,
                 },
                 None,
@@ -73,6 +77,7 @@ impl GpuContext {
             queue,
             adapter_name,
             backend,
+            limits,
         })
     }
 
@@ -197,26 +202,85 @@ const MODE_ANYWHERE: u32 = 2; // on-device anywhere match + atomic compaction
 
 const KEYGEN_THREADS: u32 = 16_384;
 const KEYGEN_WORKGROUP_SIZE: u32 = 64;
-/// Candidates generated per thread in prefix mode (mirrors BATCH_K in the shader).
-const BATCH_K: u32 = 64;
+/// Candidates generated per thread (mirrors batch_k = params[125] in the shader).
+/// Chosen at runtime; the host sizes the scratch/output buffers to match.
+const DEFAULT_BATCH_K: u32 = 256;
+const BATCH_K_MIN: u32 = 64;
+/// Ceiling on the picker regardless of how much memory the device reports, so we
+/// never build an absurd buffer (gains are well into diminishing returns by here).
+const BATCH_K_MAX: u32 = 4096;
 const SCRATCH_WORDS_PER: u64 = 64; // 4 field elements * 16 limbs
 // Comb table geometry (mirrors COMB_* in the shader).
 const COMB_WINDOWS: u32 = 32;
 const COMB_PTS_PER_WIN: u32 = 256;
 const GE_WORDS: u32 = 64;
 const TABLE_WORDS: u64 = (COMB_WINDOWS * COMB_PTS_PER_WIN * GE_WORDS) as u64;
-// y-only walk affine offsets (o+1)*B live right after the comb region: HALF =
-// BATCH_K/2 offsets, 3 field elements (x, y, x*y) = 48 words each. Mirrors
-// HALF / OFFSET_WORDS / OFFSETS_BASE in ed25519_keygen.wgsl.
-const OFFSETS_COUNT: u64 = (BATCH_K / 2) as u64;
+// y-only walk affine offsets (o+1)*B live right after the comb region: batch_k/2
+// offsets, 3 field elements (x, y, x*y) = 48 words each. Mirrors OFFSET_WORDS /
+// OFFSETS_BASE in ed25519_keygen.wgsl.
 const OFFSET_WORDS: u64 = 48;
-const TABLE_TOTAL_WORDS: u64 = TABLE_WORDS + OFFSETS_COUNT * OFFSET_WORDS;
 const OUT_HEADER: usize = 4;
 const MAX_MATCHES: usize = 256;
 const PARAMS_WORDS: usize = 128;
 /// Longest prefix the on-device base32 match supports: char j reads bytes
 /// `5j/8` and `5j/8 + 1`, so j <= 47 keeps both bytes within the 32-byte pubkey.
 use crate::crypto::MAX_DEVICE_PREFIX;
+
+/// Total bytes the per-dispatch GPU buffers occupy at a given batch_k: scratch
+/// (largest, write-all stride) + output + staging + the comb/offset table. Shown
+/// in the picker so the user sees the memory footprint of a choice.
+pub fn est_footprint_bytes(batch_k: u32) -> u64 {
+    let k = batch_k as u64;
+    let threads = KEYGEN_THREADS as u64;
+    let scratch = threads * k * SCRATCH_WORDS_PER * 4;
+    let output = threads * k * 16 * 4;
+    let staging = output;
+    let table = (TABLE_WORDS + (k / 2) * OFFSET_WORDS) * 4;
+    scratch + output + staging + table
+}
+
+/// Largest power-of-two batch_k whose buffers the device can allocate. Two walls:
+/// (1) the scratch buffer (threads * k * 256 bytes, the largest single binding)
+/// must fit min(max_buffer_size, max_storage_buffer_binding_size) - the hard
+/// per-binding limit that makes allocation fail if exceeded; (2) the total
+/// footprint (scratch + output + staging + table) must stay under a safety
+/// fraction of max_buffer_size, leaving headroom for the driver and other apps.
+/// Floored at BATCH_K_MIN (the value the app has always required), capped at
+/// BATCH_K_MAX.
+pub fn max_batch_k(limits: &wgpu::Limits) -> u32 {
+    let binding_wall = limits
+        .max_buffer_size
+        .min(limits.max_storage_buffer_binding_size as u64);
+    let total_budget = (limits.max_buffer_size as f64 * 0.85) as u64;
+    let scratch_per_k = KEYGEN_THREADS as u64 * SCRATCH_WORDS_PER * 4; // scratch bytes per unit of k
+    let fits = |k: u32| -> bool {
+        (k as u64) * scratch_per_k <= binding_wall && est_footprint_bytes(k) <= total_budget
+    };
+    let mut k = BATCH_K_MIN;
+    while k * 2 <= BATCH_K_MAX && fits(k * 2) {
+        k *= 2;
+    }
+    k
+}
+
+/// Power-of-two batch_k choices the device can allocate, ascending from
+/// BATCH_K_MIN up to max_batch_k.
+pub fn batch_k_options(limits: &wgpu::Limits) -> Vec<u32> {
+    let max = max_batch_k(limits);
+    let mut opts = Vec::new();
+    let mut k = BATCH_K_MIN;
+    while k <= max {
+        opts.push(k);
+        k *= 2;
+    }
+    opts
+}
+
+/// Preferred starting batch_k: the default, clamped down to what the device can
+/// allocate so a memory-constrained GPU picks the largest value that fits.
+pub fn default_batch_k(limits: &wgpu::Limits) -> u32 {
+    DEFAULT_BATCH_K.min(max_batch_k(limits))
+}
 
 pub struct KeygenPipeline {
     main_pipeline: wgpu::ComputePipeline,
@@ -225,6 +289,9 @@ pub struct KeygenPipeline {
     output_buf: wgpu::Buffer,
     staging_buf: wgpu::Buffer,
     pub threads: u32,
+    /// Candidates generated per thread per dispatch; sizes the scratch/output
+    /// buffers and is passed to the shader via params[125].
+    pub batch_k: u32,
     workgroups: u32,
     /// Params with the basepoint (and threads) pre-filled; per-dispatch fields
     /// (seed, batch, mode, pattern) are overwritten before each submit.
@@ -233,7 +300,9 @@ pub struct KeygenPipeline {
 }
 
 impl KeygenPipeline {
-    pub fn new(ctx: &GpuContext) -> Result<Self> {
+    pub fn new(ctx: &GpuContext, batch_k: u32) -> Result<Self> {
+        let batch_k = batch_k.clamp(BATCH_K_MIN, BATCH_K_MAX);
+        let table_total_words = TABLE_WORDS + (batch_k as u64 / 2) * OFFSET_WORDS;
         let shader = ctx
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -295,6 +364,7 @@ impl KeygenPipeline {
         base_params[28..44].copy_from_slice(&by);
         base_params[44..60].copy_from_slice(&bz);
         base_params[60..76].copy_from_slice(&bt);
+        base_params[125] = batch_k;
 
         let params_buf = ctx
             .device
@@ -305,14 +375,14 @@ impl KeygenPipeline {
             });
         let table_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("keygen-table"),
-            size: TABLE_TOTAL_WORDS * 4,
+            size: table_total_words * 4,
             usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
         // Sized for write-all mode (the largest layout): every candidate
-        // (threads * BATCH_K) writes a 16-u32 record. Compaction modes use only
+        // (threads * batch_k) writes a 16-u32 record. Compaction modes use only
         // the small header + matches region at the front of the same buffer.
-        let output_size = (KEYGEN_THREADS as u64) * (BATCH_K as u64) * 16 * 4;
+        let output_size = (KEYGEN_THREADS as u64) * (batch_k as u64) * 16 * 4;
         let output_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("keygen-output"),
             size: output_size,
@@ -327,8 +397,8 @@ impl KeygenPipeline {
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        // Per-candidate scratch (prefix mode). threads * BATCH_K * 4 field elems.
-        let scratch_size = (KEYGEN_THREADS as u64) * (BATCH_K as u64) * SCRATCH_WORDS_PER * 4;
+        // Per-candidate scratch (write-all mode). threads * batch_k * 4 field elems.
+        let scratch_size = (KEYGEN_THREADS as u64) * (batch_k as u64) * SCRATCH_WORDS_PER * 4;
         let scratch_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("keygen-scratch"),
             size: scratch_size,
@@ -384,6 +454,7 @@ impl KeygenPipeline {
             output_buf,
             staging_buf,
             threads: KEYGEN_THREADS,
+            batch_k,
             workgroups: KEYGEN_THREADS / KEYGEN_WORKGROUP_SIZE,
             base_params,
             output_size,
@@ -499,7 +570,7 @@ fn keygen_dispatch(
             .map(|i| parse_pair(words, OUT_HEADER + i * 16))
             .collect()
     } else {
-        (0..pipe.threads as usize * BATCH_K as usize)
+        (0..pipe.threads as usize * pipe.batch_k as usize)
             .map(|i| parse_pair(words, i * 16))
             .collect()
     };
@@ -552,8 +623,8 @@ pub fn run_keygen(
     use rayon::prelude::*;
 
     let (mode, pattern_syms) = pick_mode(&match_type, &pattern);
-    // Every mode walks BATCH_K candidates per thread.
-    let per_dispatch = pipe.threads as u64 * BATCH_K as u64;
+    // Every mode walks batch_k candidates per thread.
+    let per_dispatch = pipe.threads as u64 * pipe.batch_k as u64;
 
     let mut rng = rand::thread_rng();
     let mut batch_id: u32 = 0;
@@ -604,6 +675,7 @@ pub fn run_keygen(
 pub fn run_keygen_bench(
     ctx: &GpuContext,
     match_type: crate::crypto::MatchType,
+    batch_k: u32,
     attempts: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
     rate_out: Arc<Mutex<Option<f64>>>,
@@ -611,10 +683,10 @@ pub fn run_keygen_bench(
 ) -> Result<()> {
     use rand::RngCore;
     use rayon::prelude::*;
-    let pipe = KeygenPipeline::new(ctx)?;
+    let pipe = KeygenPipeline::new(ctx, batch_k)?;
     let pattern = b"ovdsbench42".to_vec(); // 11 valid base32 chars; never matches
     let (mode, pattern_syms) = pick_mode(&match_type, &pattern);
-    let per_dispatch = pipe.threads as u64 * BATCH_K as u64;
+    let per_dispatch = pipe.threads as u64 * pipe.batch_k as u64;
     let mut rng = rand::thread_rng();
     let mut base_seed = [0u8; 32];
     let mut batch_id: u32 = 0;
@@ -639,7 +711,11 @@ pub fn run_keygen_bench(
     run_one(&base_seed, batch_id)?;
     batch_id = batch_id.wrapping_add(1);
 
-    // Time only the productive window.
+    // Time only the productive window. Publish the steady-state rate live each
+    // iteration (produced / productive-elapsed) so the UI shows the real rate from
+    // the first productive dispatch instead of an average dragged down by the
+    // pipeline build + warm-up - which grows with batch_k and otherwise makes a
+    // high-K bench read ~half its true speed.
     let mut produced: u64 = 0;
     let start = Instant::now();
     while !stop.load(Ordering::Relaxed) && start.elapsed().as_secs_f64() < target_secs {
@@ -647,6 +723,8 @@ pub fn run_keygen_bench(
         run_one(&base_seed, batch_id)?;
         produced += per_dispatch;
         attempts.fetch_add(per_dispatch, Ordering::Relaxed);
+        let secs = start.elapsed().as_secs_f64().max(1e-6);
+        *rate_out.lock().unwrap() = Some(produced as f64 / secs);
         batch_id = batch_id.wrapping_add(1);
     }
     let secs = start.elapsed().as_secs_f64().max(1e-6);
@@ -661,10 +739,15 @@ pub fn run_keygen_bench(
 /// so it measures pure generation. Drives the ignored `bench` throughput test;
 /// not on the UI path. Lives here to reach the crate-private dispatch internals.
 #[cfg(test)]
-pub(crate) fn bench_dispatch_rate(ctx: &GpuContext, runs: u32, n: u32) -> Result<Vec<f64>> {
-    let pipe = KeygenPipeline::new(ctx)?;
+pub(crate) fn bench_dispatch_rate(
+    ctx: &GpuContext,
+    batch_k: u32,
+    runs: u32,
+    n: u32,
+) -> Result<Vec<f64>> {
+    let pipe = KeygenPipeline::new(ctx, batch_k)?;
     let syms = pattern_to_symbols(b"ovdsbench42").unwrap();
-    let per = pipe.threads as u64 * BATCH_K as u64;
+    let per = pipe.threads as u64 * pipe.batch_k as u64;
     keygen_dispatch(ctx, &pipe, &[0u8; 32], 0, MODE_PREFIX, &syms)?; // warm up
     let mut samples = Vec::with_capacity(runs as usize);
     for run in 0..runs {
@@ -682,6 +765,39 @@ pub(crate) fn bench_dispatch_rate(ctx: &GpuContext, runs: u32, n: u32) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The BATCH_K picker must stay within the device's allocation limits (no GPU
+    /// needed - pure function of wgpu::Limits). Guards the "can't overshoot" promise.
+    #[test]
+    fn batch_k_bounded_by_limits() {
+        // Generous device (this machine's class): 4 GiB binding, ~10 GiB buffer.
+        let big = wgpu::Limits {
+            max_storage_buffer_binding_size: u32::MAX,
+            max_buffer_size: 10_726_686_720,
+            ..Default::default()
+        };
+        let opts = batch_k_options(&big);
+        assert_eq!(opts.first(), Some(&BATCH_K_MIN));
+        assert!(opts.iter().all(|k| k.is_power_of_two()));
+        assert_eq!(*opts.last().unwrap(), max_batch_k(&big));
+        // Every option's scratch fits the per-binding wall.
+        let wall = big.max_buffer_size.min(big.max_storage_buffer_binding_size as u64);
+        for &k in &opts {
+            assert!((k as u64) * KEYGEN_THREADS as u64 * SCRATCH_WORDS_PER * 4 <= wall);
+        }
+        assert!(default_batch_k(&big) <= max_batch_k(&big));
+
+        // Tiny device: only the BATCH_K_MIN floor is offered, and the default
+        // clamps down to it (never overshoots).
+        let tiny = wgpu::Limits {
+            max_storage_buffer_binding_size: 256 * 1024 * 1024,
+            max_buffer_size: 256 * 1024 * 1024,
+            ..Default::default()
+        };
+        assert_eq!(max_batch_k(&tiny), BATCH_K_MIN);
+        assert_eq!(batch_k_options(&tiny), vec![BATCH_K_MIN]);
+        assert_eq!(default_batch_k(&tiny), BATCH_K_MIN);
+    }
 
     /// Mirror of the WGSL `derive_scalar` so we can reproduce the GPU's clamped
     /// scalar bytes on the host.
@@ -733,18 +849,18 @@ mod tests {
             eprintln!("skipping GPU test: no adapter");
             return;
         };
-        let pipe = KeygenPipeline::new(&ctx).expect("pipeline init");
+        let pipe = KeygenPipeline::new(&ctx, DEFAULT_BATCH_K).expect("pipeline init");
         // Exercise a couple of batches/seeds so we cover varied scalars. Write-all
-        // now returns every incremental candidate (threads * BATCH_K): flat index
-        // i maps to thread = i / BATCH_K, step j = i % BATCH_K, and the candidate
+        // now returns every incremental candidate (threads * batch_k): flat index
+        // i maps to thread = i / batch_k, step j = i % batch_k, and the candidate
         // scalar is s0(thread) + j. Sampling across the flat range covers both the
         // comb start point (j == 0) and the incremental adds (j > 0).
         for (base_seed, batch_id) in [([0u8; 32], 0u32), ([0x5Au8; 32], 7u32)] {
             let pairs = keygen_dispatch(&ctx, &pipe, &base_seed, batch_id, MODE_WRITE_ALL, &[])
                 .expect("dispatch");
             for (i, kp) in pairs.iter().enumerate().step_by(1009) {
-                let thread = i as u32 / BATCH_K;
-                let j = i as u32 % BATCH_K;
+                let thread = i as u32 / pipe.batch_k;
+                let j = i as u32 % pipe.batch_k;
                 let s0 = derive_scalar_host(&base_seed, batch_id, thread);
                 let expected_scalar = scalar_add_host(s0, j);
                 assert_eq!(kp.scalar, expected_scalar, "candidate {i}: scalar mismatch");
@@ -771,7 +887,7 @@ mod tests {
             eprintln!("skipping GPU test: no adapter");
             return;
         };
-        let pipe = KeygenPipeline::new(&ctx).expect("pipeline init");
+        let pipe = KeygenPipeline::new(&ctx, DEFAULT_BATCH_K).expect("pipeline init");
         let syms = pattern_to_symbols(b"a").unwrap();
         let pairs =
             keygen_dispatch(&ctx, &pipe, &[0x33u8; 32], 1, MODE_PREFIX, &syms).expect("dispatch");
@@ -806,7 +922,7 @@ mod tests {
             eprintln!("skipping GPU test: no adapter");
             return;
         };
-        let pipe = KeygenPipeline::new(&ctx).expect("pipeline init");
+        let pipe = KeygenPipeline::new(&ctx, DEFAULT_BATCH_K).expect("pipeline init");
         let pattern = b"aa".to_vec(); // 2 chars: found within the first batch
         let attempts = Arc::new(AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));
@@ -846,7 +962,7 @@ mod tests {
             eprintln!("skipping GPU test: no adapter");
             return;
         };
-        let pipe = KeygenPipeline::new(&ctx).expect("pipeline init");
+        let pipe = KeygenPipeline::new(&ctx, DEFAULT_BATCH_K).expect("pipeline init");
         let pattern = b"a".to_vec(); // 1 char: ~1/32, found within the first batch
         let attempts = Arc::new(AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));

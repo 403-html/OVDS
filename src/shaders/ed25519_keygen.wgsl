@@ -5,7 +5,7 @@
 //     table of multiples (build_table), no doublings.
 //   * Incremental batch (prefix mode of main): each thread computes one start
 //     point P0 = s0*B via the comb, then walks P0, P0+B, P0+2B, ... emitting
-//     BATCH_K candidates. Each step is a single projective add and all the
+//     batch_k candidates. Each step is a single projective add and all the
 //     per-candidate inversions are batched into one (Montgomery's trick), so
 //     the amortized cost per candidate is ~one point add. Matching prefixes are
 //     compacted on-device; the scalar for candidate j is just s0 + j.
@@ -25,6 +25,7 @@
 //   [44..60]  bZ
 //   [60..76]  bT
 //   [76..124] pattern (one base32 5-bit value per char, prefix mode only)
+//   [125]     batch_k (candidates per thread; chosen at runtime, sizes buffers)
 @group(0) @binding(0) var<storage, read> params: array<u32, 128>;
 // Comb table: COMB_WINDOWS * COMB_PTS_PER_WIN points, each 64 u32 (X|Y|Z|T,
 // 16 limbs each). Built once by build_table, read by the main keygen kernel.
@@ -50,16 +51,16 @@ const MAX_MATCHES: u32 = 256u;
 const MAX_DEVICE_PREFIX: u32 = 48u;
 
 // Incremental batch: each thread computes P0 = s0*B once (comb), then walks
-// P0, P0+B, P0+2B, ... emitting BATCH_K candidates. Each step is one projective
+// P0, P0+B, P0+2B, ... emitting batch_k candidates. Each step is one projective
 // point add; the per-candidate inversions are batched (one inversion/thread).
-const BATCH_K: u32 = 64u;
+// batch_k is chosen at runtime (params[125]); the host sizes the scratch/output
+// buffers to match, so it can be tuned to the GPU's memory budget.
 const SCRATCH_WORDS_PER: u32 = 64u; // 4 field elements * 16 limbs (write-all path)
 
-// y-only walk (prefix/anywhere): each thread tests center +/- offset for HALF
-// affine offsets = BATCH_K candidates, storing only 2 field elements/candidate
-// (the left-fold division u and yden). Affine offsets (o+1)*B live in the table
-// buffer right after the comb region, 3 field elements (x, y, x*y) each.
-const HALF: u32 = BATCH_K / 2u;
+// y-only walk (prefix/anywhere): each thread tests center +/- offset for half =
+// batch_k/2 affine offsets = batch_k candidates, storing only 2 field
+// elements/candidate (the left-fold division u and yden). Affine offsets (o+1)*B
+// live in the table buffer right after the comb region, 3 field elements each.
 const SCRATCH_WORDS_PER_Y: u32 = 32u; // 2 field elements * 16 limbs
 const OFFSETS_BASE: u32 = COMB_WINDOWS * COMB_PTS_PER_WIN * GE_WORDS;
 const OFFSET_WORDS: u32 = 48u; // 3 field elements * 16 limbs
@@ -691,10 +692,11 @@ fn build_table(@builtin(global_invocation_id) gid: vec3<u32>) {
         for (var d = 0u; d < COMB_W; d = d + 1u) { base = ge_double(base); }
     }
 
-    // Affine offsets (o+1)*B for the y-only walk, o = 0..HALF-1.
+    // Affine offsets (o+1)*B for the y-only walk, o = 0..half-1.
+    let half = params[125u] >> 1u;
     let Bp = load_basepoint();
     var acc = Bp; // 1*B
-    for (var o = 0u; o < HALF; o = o + 1u) {
+    for (var o = 0u; o < half; o = o + 1u) {
         store_offset(o, ge_to_affine(acc));
         acc = ge_add(acc, Bp);
     }
@@ -711,6 +713,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let batch_id = params[8u];
     let mode = params[10u];
     let plen = params[11u];
+    let batch_k = params[125u];
+    let half = batch_k >> 1u;
     var s0 = derive_scalar(base_seed, batch_id, idx);
     let B = load_basepoint();
 
@@ -724,7 +728,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         var P = comb_scalarmult(s0);
         let dTb = fe_mul(B.T, D_CONST); // d * T_B, precomputed once for the mixed add
         var acc = fe_one();
-        for (var j = 0u; j < BATCH_K; j = j + 1u) {
+        for (var j = 0u; j < batch_k; j = j + 1u) {
             let cbase = (j * SCRATCH_WORDS_PER) * threads + idx;
             scratch_store_fe(cbase, threads, P.X);
             scratch_store_fe(cbase + 16u * threads, threads, P.Y);
@@ -734,15 +738,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             P = ge_add_mixed(P, B.X, B.Y, dTb);
         }
         var inv = fe_invert(acc);
-        for (var jj = 0u; jj < BATCH_K; jj = jj + 1u) {
-            let j = BATCH_K - 1u - jj;
+        for (var jj = 0u; jj < batch_k; jj = jj + 1u) {
+            let j = batch_k - 1u - jj;
             let cbase = (j * SCRATCH_WORDS_PER) * threads + idx;
             let zj = scratch_load_fe(cbase + 32u * threads, threads);
             let pre = scratch_load_fe(cbase + 48u * threads, threads);
             let zinv = fe_mul(inv, pre);
             inv = fe_mul(inv, zj);
             let pubkey = compress_zinv(scratch_load_fe(cbase, threads), scratch_load_fe(cbase + 16u * threads, threads), zinv);
-            write_record((idx * BATCH_K + j) * 16u, pubkey, scalar_add_u32(s0, j));
+            write_record((idx * batch_k + j) * 16u, pubkey, scalar_add_u32(s0, j));
         }
         return;
     }
@@ -760,7 +764,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // index L = 2*o is center + offset (scalar s0 + (o+1)); L = 2*o+1 is center -
     // offset (scalar s0 - (o+1)). Store u = (running yden product)*ynum, and yden.
     var py = fe_one();
-    for (var o = 0u; o < HALF; o = o + 1u) {
+    for (var o = 0u; o < half; o = o + 1u) {
         let off = load_offset(o);
         let cc = fe_mul(off.xy, C.Z); // off.xy * Z1 (shared by +/-)
         let av = fe_mul(C.X, off.y);  // X1 * off.y
@@ -783,8 +787,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // One inversion for the whole batch, then backward fold: y[L] = u[L] * T.
     var T = fe_invert(py);
-    for (var lb = 0u; lb < BATCH_K; lb = lb + 1u) {
-        let L = BATCH_K - 1u - lb;
+    for (var lb = 0u; lb < batch_k; lb = lb + 1u) {
+        let L = batch_k - 1u - lb;
         let cb = (L * SCRATCH_WORDS_PER_Y) * threads + idx;
         let u = scratch_load_fe(cb, threads);
         let yden = scratch_load_fe(cb + 16u * threads, threads);
