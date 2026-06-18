@@ -13,6 +13,9 @@ pub struct WorkerState {
     pub stop: Arc<AtomicBool>,
     pub result: Arc<Mutex<Option<FoundResult>>>,
     pub error: Arc<Mutex<Option<String>>>,
+    /// Steady-state keys/s reported by a GPU benchmark (excludes pipeline build +
+    /// warm-up). Preferred over attempts/wall-elapsed, which includes that startup.
+    pub bench_rate: Arc<Mutex<Option<f64>>>,
 }
 
 impl WorkerState {
@@ -22,6 +25,7 @@ impl WorkerState {
             stop: Arc::new(AtomicBool::new(false)),
             result: Arc::new(Mutex::new(None)),
             error: Arc::new(Mutex::new(None)),
+            bench_rate: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -123,6 +127,16 @@ impl FocusedPanel {
     }
 }
 
+/// Selectable rows inside the SEARCH panel. Up/Down move this cursor; Left/Right
+/// change the selected field's value (typing edits the pattern only on Pattern).
+#[derive(Clone, Copy, PartialEq)]
+pub enum SearchField {
+    Pattern,
+    Match,
+    Backend,
+    Batch,
+}
+
 pub struct App {
     pub pattern: String,
     pub match_type: MatchType,
@@ -135,9 +149,16 @@ pub struct App {
     pub threads: usize,
     pub backend: Backend,
     pub gpu: Option<Arc<GpuContext>>,
+    /// Selected GPU candidates-per-thread (BATCH_K). Higher = faster but more GPU
+    /// memory; the options are bounded by the device so it can't overshoot.
+    pub batch_k: u32,
+    /// Power-of-two BATCH_K choices the device can allocate (empty if no GPU).
+    pub batch_k_options: Vec<u32>,
     pub gpu_init_error: Option<String>,
     pub status_msg: String,
     pub focused_panel: FocusedPanel,
+    /// Which row of the SEARCH panel the cursor is on (when that panel is focused).
+    pub search_field: SearchField,
     pub quit: bool,
 }
 
@@ -147,6 +168,13 @@ impl App {
             Ok(ctx) => (Some(Arc::new(ctx)), None),
             Err(e) => (None, Some(e.to_string())),
         };
+        let (batch_k, batch_k_options) = match &gpu {
+            Some(ctx) => (
+                crate::gpu::default_batch_k(&ctx.limits),
+                crate::gpu::batch_k_options(&ctx.limits),
+            ),
+            None => (0, Vec::new()),
+        };
         Self {
             pattern: String::new(),
             match_type: MatchType::Prefix,
@@ -155,9 +183,12 @@ impl App {
             threads: rayon::current_num_threads(),
             backend: Backend::Cpu,
             gpu,
+            batch_k,
+            batch_k_options,
             gpu_init_error,
             status_msg: String::new(),
             focused_panel: FocusedPanel::Pattern,
+            search_field: SearchField::Pattern,
             quit: false,
         }
     }
@@ -210,6 +241,71 @@ impl App {
         } else {
             self.match_type.prev()
         };
+    }
+
+    /// Step the selected GPU BATCH_K through the device-bounded options (no wrap),
+    /// so the user can dial throughput vs memory without overshooting what the GPU
+    /// can allocate.
+    pub fn cycle_batch_k(&mut self, forward: bool) {
+        let Some(cur) = self.batch_k_options.iter().position(|&k| k == self.batch_k) else {
+            // batch_k not in the list (e.g. no GPU): snap to the first option if any.
+            if let Some(&first) = self.batch_k_options.first() {
+                self.batch_k = first;
+            }
+            return;
+        };
+        let next = if forward {
+            (cur + 1).min(self.batch_k_options.len() - 1)
+        } else {
+            cur.saturating_sub(1)
+        };
+        self.batch_k = self.batch_k_options[next];
+    }
+
+    /// SEARCH-panel rows available for the cursor. Batch only exists on the GPU
+    /// backend (and when a GPU is present), so it appears/disappears with backend.
+    pub fn search_fields(&self) -> Vec<SearchField> {
+        let mut v = vec![
+            SearchField::Pattern,
+            SearchField::Match,
+            SearchField::Backend,
+        ];
+        if self.backend == Backend::Gpu && self.gpu.is_some() {
+            v.push(SearchField::Batch);
+        }
+        v
+    }
+
+    /// Move the SEARCH-panel cursor up/down between fields (no wrap).
+    pub fn move_field(&mut self, down: bool) {
+        let fields = self.search_fields();
+        let cur = fields
+            .iter()
+            .position(|&f| f == self.search_field)
+            .unwrap_or(0);
+        let next = if down {
+            (cur + 1).min(fields.len() - 1)
+        } else {
+            cur.saturating_sub(1)
+        };
+        self.search_field = fields[next];
+    }
+
+    /// Left/Right on the selected SEARCH field changes its value. Pattern is edited
+    /// by typing, so Left/Right are a no-op there.
+    pub fn change_field(&mut self, forward: bool) {
+        match self.search_field {
+            SearchField::Pattern => {}
+            SearchField::Match => self.cycle_match_type(forward),
+            SearchField::Backend => {
+                self.toggle_backend();
+                // Backend toggle can remove the Batch row; keep the cursor valid.
+                if !self.search_fields().contains(&self.search_field) {
+                    self.search_field = SearchField::Backend;
+                }
+            }
+            SearchField::Batch => self.cycle_batch_k(forward),
+        }
     }
 
     pub fn start_benchmark(&mut self) {
@@ -298,6 +394,7 @@ impl App {
         let w = worker.clone();
         let gpu_thread = Arc::clone(&gpu);
         let mt_thread = match_type.clone();
+        let batch_k = self.batch_k;
 
         std::thread::spawn(move || {
             let attempts = Arc::clone(&w.attempts);
@@ -305,7 +402,16 @@ impl App {
             let error = Arc::clone(&w.error);
             // Isolate any wgpu panic (e.g. shader validation) from the TUI.
             let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                crate::gpu::run_keygen_bench(&gpu_thread, mt_thread, attempts, stop, 5.0)
+                let rate_out = Arc::clone(&w.bench_rate);
+                crate::gpu::run_keygen_bench(
+                    &gpu_thread,
+                    mt_thread,
+                    batch_k,
+                    attempts,
+                    stop,
+                    rate_out,
+                    5.0,
+                )
             }));
             match res {
                 Ok(Err(e)) => *error.lock().unwrap() = Some(format!("GPU error: {e}")),
@@ -448,6 +554,7 @@ impl App {
         let w = worker.clone();
         let pattern = self.pattern.clone().into_bytes();
         let match_type = self.match_type.clone();
+        let batch_k = self.batch_k;
 
         std::thread::spawn(move || {
             use crate::crypto::{address_from_pubkey, save_keys_expanded};
@@ -457,7 +564,7 @@ impl App {
             let result = Arc::clone(&w.result);
 
             let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let pipe = crate::gpu::KeygenPipeline::new(&gpu)?;
+                let pipe = crate::gpu::KeygenPipeline::new(&gpu, batch_k)?;
                 let found = Arc::new(Mutex::new(None));
                 crate::gpu::run_keygen(
                     &gpu,
@@ -516,7 +623,12 @@ impl App {
                 match_type,
             } => {
                 let elapsed = started.elapsed();
-                if worker.stop.load(Ordering::Relaxed) || elapsed >= Duration::from_secs(6) {
+                // Normal completion is driven by worker.stop (set when the bench
+                // thread finishes); the time bound is only a safety net for a hung
+                // worker. It must exceed pipeline build + warm-up + the 5s window,
+                // which grows with batch_k - a tight cap truncated high-K GPU benches
+                // before the steady-state rate was recorded (read as ~half speed).
+                if worker.stop.load(Ordering::Relaxed) || elapsed >= Duration::from_secs(30) {
                     let attempts = worker.attempts();
                     let secs = elapsed.as_secs_f64().max(0.1);
                     let rate = attempts as f64 / secs;
@@ -537,12 +649,16 @@ impl App {
                             if let Some(e) = err {
                                 self.status_msg = e;
                             } else {
+                                // Prefer the steady-state rate the bench measured
+                                // (build + warm-up excluded); fall back to the cold
+                                // attempts/elapsed average only if it is missing.
+                                let gpu_rate = worker.bench_rate.lock().unwrap().unwrap_or(rate);
                                 self.benchmarks
-                                    .insert((Backend::Gpu, measured.clone()), rate);
+                                    .insert((Backend::Gpu, measured.clone()), gpu_rate);
                                 self.status_msg = format!(
                                     "GPU benchmark done ({}): {:.0} keys/s",
                                     measured.label(),
-                                    rate
+                                    gpu_rate
                                 );
                             }
                         }

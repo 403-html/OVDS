@@ -8,7 +8,7 @@ mod gpu;
 mod stats;
 mod ui;
 
-use app::{App, FocusedPanel, Mode};
+use app::{App, FocusedPanel, Mode, SearchField};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
     execute,
@@ -111,11 +111,20 @@ fn handle_key(app: &mut App, code: KeyCode) {
         Mode::Idle => match &app.focused_panel {
             FocusedPanel::Pattern => match code {
                 KeyCode::Esc => app.quit = true,
-                KeyCode::Backspace | KeyCode::Delete => app.backspace(),
-                KeyCode::Left => app.cycle_match_type(false),
-                KeyCode::Right => app.cycle_match_type(true),
-                KeyCode::Up | KeyCode::Down => app.toggle_backend(),
-                KeyCode::Char(c) => app.type_char(c.to_ascii_lowercase()),
+                // Up/Down move the field cursor; Left/Right change the selected value.
+                KeyCode::Up => app.move_field(false),
+                KeyCode::Down => app.move_field(true),
+                KeyCode::Left => app.change_field(false),
+                KeyCode::Right => app.change_field(true),
+                // Typing/backspace edit the pattern, only when that row is selected.
+                KeyCode::Backspace | KeyCode::Delete
+                    if app.search_field == SearchField::Pattern =>
+                {
+                    app.backspace()
+                }
+                KeyCode::Char(c) if app.search_field == SearchField::Pattern => {
+                    app.type_char(c.to_ascii_lowercase())
+                }
                 _ => {}
             },
             FocusedPanel::Actions => match code {
