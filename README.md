@@ -22,9 +22,8 @@ Generate a custom `.onion` address for your Tor hidden service. Type a word, pic
 - Prefix, suffix, or anywhere matching
 - CPU backend: all cores via Rayon, prefix fast-path skips SHA3-256 (~2x faster)
 - GPU backend (v0.3.0): real ed25519 keygen on the device via wgpu compute, cross-platform (Metal on macOS, Vulkan on Linux, DX12 on Windows)
-- GPU prefix and anywhere matching run on-device at full keygen rate; suffix uses the same incremental kernel with a parallel host scan (v0.4.0)
-- GPU prefix/anywhere use a y-only additive walk (v0.6.0): a Tor prefix needs only the y-coordinate, so each candidate is ~5 field muls instead of ~13 (~1.5x more keys/s)
-- Selectable GPU batch size (v0.6.0): a larger batch amortises per-thread setup for more keys/s (up to ~2.2x on an M3 Pro); the picker is bounded by the device's memory so it cannot overshoot. See [BENCHMARKS.md](BENCHMARKS.md)
+- GPU prefix and anywhere matching run on-device; suffix is matched on the host (v0.4.0)
+- Selectable GPU batch size (v0.6.0): trade GPU memory for throughput, bounded by your device so it cannot overshoot
 - Live throughput sparkline, ETA at p50/p95, probabilistic progress gauge
 - Side-by-side CPU vs GPU benchmark columns in the time estimates panel
 - Saves in Tor's native format, ready to drop into `HiddenServiceDir`
