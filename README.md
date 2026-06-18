@@ -23,13 +23,14 @@ Generate a custom `.onion` address for your Tor hidden service. Type a word, pic
 - GPU backend (v0.3.0): real ed25519 keygen on the device via wgpu compute, cross-platform (Metal on macOS, Vulkan on Linux, DX12 on Windows)
 - GPU prefix and anywhere matching run on-device at full keygen rate; suffix uses the same incremental kernel with a parallel host scan (v0.4.0)
 - GPU prefix/anywhere use a y-only additive walk (v0.6.0): a Tor prefix needs only the y-coordinate, so each candidate is ~5 field muls instead of ~13 (~1.5x more keys/s)
+- Selectable GPU batch size (v0.6.0): a larger batch amortises per-thread setup for more keys/s (up to ~2.2x on an M3 Pro); the picker is bounded by the device's memory so it cannot overshoot. See [BENCHMARKS.md](BENCHMARKS.md)
 - Live throughput sparkline, ETA at p50/p95, probabilistic progress gauge
 - Side-by-side CPU vs GPU benchmark columns in the time estimates panel
 - Saves in Tor's native format, ready to drop into `HiddenServiceDir`
 
 ## Backends
 
-Toggle between CPU and GPU from the SEARCH panel with `↑ ↓`. Run `[b]` to benchmark the active backend; both rates are remembered and shown side-by-side in the time estimates table.
+In the SEARCH panel, move the field cursor with `↑ ↓` and change the selected field with `← →`: this is how you switch between CPU and GPU, pick the match type, and (on GPU) set the batch size. Run `[b]` to benchmark the active backend; both rates are remembered and shown side-by-side in the time estimates table.
 
 | Backend | Status | Notes |
 |---------|--------|-------|
@@ -67,10 +68,10 @@ Run `[b]` inside the app to benchmark your hardware first. See [BENCHMARKS.md](B
 
 | Key | Action |
 |-----|--------|
-| `a-z` `2-7` | Type pattern (base32 alphabet) |
+| `a-z` `2-7` | Type pattern (base32 alphabet; string field) |
 | `Backspace` | Delete last character |
-| `← →` | Cycle match type |
-| `↑ ↓` | Toggle backend (CPU ↔ GPU) |
+| `↑ ↓` | Move field cursor (string / match / backend / batch) |
+| `← →` | Change the selected field (match type, backend, or GPU batch size) |
 | `Tab` | Switch panel |
 | `b` | Benchmark active backend |
 | `g` | Start search |
