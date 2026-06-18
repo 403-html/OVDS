@@ -7,10 +7,11 @@ Generate a custom `.onion` address for your Tor hidden service. Type a word, pic
  mode  ›  estimate
 ┌ SEARCH ───────────────────────────────────────────────────────────────────────┐
 │                                                                               │
-│  string  ›  fireside█                                                         │
+│  string  ›  fireside                                                          │
 │  chars   ›  ✓ 8 chars                                                         │
-│  match   ›  [Prefix]  Suffix  Anywhere    ← →                                 │
-│  backend ›  [CPU]  GPU   8 threads        ↑ ↓                                 │
+│  match   ›  [Prefix]  Suffix  Anywhere                                        │
+│  backend ›  CPU  [GPU]   Metal · Apple M3 Pro                                 │
+│▸ batch   ›  64  128  [256]  512   ~1.6 GB GPU   ← →                           │
 │  example ›  firesideabcdefghijklmnop234567abcdefghij.onion                    │
 │                                                                               │
 └───────────────────────────────────────────────────────────────────────────────┘
