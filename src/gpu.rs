@@ -781,7 +781,9 @@ mod tests {
         assert!(opts.iter().all(|k| k.is_power_of_two()));
         assert_eq!(*opts.last().unwrap(), max_batch_k(&big));
         // Every option's scratch fits the per-binding wall.
-        let wall = big.max_buffer_size.min(big.max_storage_buffer_binding_size as u64);
+        let wall = big
+            .max_buffer_size
+            .min(big.max_storage_buffer_binding_size as u64);
         for &k in &opts {
             assert!((k as u64) * KEYGEN_THREADS as u64 * SCRATCH_WORDS_PER * 4 <= wall);
         }

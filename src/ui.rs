@@ -135,7 +135,11 @@ fn draw_pattern_panel(f: &mut Frame, app: &App, area: Rect) {
     // change that row's value.
     let sel = |fld: SearchField| focused && app.search_field == fld;
     let field_label = |name: &str, fld: SearchField| {
-        let (mark, col) = if sel(fld) { ("▸ ", ACCENT) } else { ("  ", DIM) };
+        let (mark, col) = if sel(fld) {
+            ("▸ ", ACCENT)
+        } else {
+            ("  ", DIM)
+        };
         Span::styled(format!("{}{:<8}", mark, name), Style::default().fg(col))
     };
     let arrows = |fld: SearchField| {
