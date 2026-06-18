@@ -7,7 +7,7 @@ use ratatui::{
     widgets::{Axis, Block, Borders, Chart, Dataset, Gauge, GraphType, Paragraph, Wrap},
 };
 
-use crate::app::{App, FocusedPanel, Mode};
+use crate::app::{App, FocusedPanel, Mode, SearchField};
 use crate::crypto::{ADDRESS_LEN, Backend, MatchType, validate_pattern};
 use crate::stats::{
     cdf, expected_attempts, format_count, format_duration, format_rate, match_probability,
@@ -130,13 +130,29 @@ fn draw_pattern_panel(f: &mut Frame, app: &App, area: Rect) {
 
     let (valid, invalid_indices) = validate_pattern(&app.pattern);
 
+    // Field cursor: a row is "selected" only while the panel is focused. The label
+    // gets a ▸ marker + accent so Up/Down selection is visible; Left/Right then
+    // change that row's value.
+    let sel = |fld: SearchField| focused && app.search_field == fld;
+    let field_label = |name: &str, fld: SearchField| {
+        let (mark, col) = if sel(fld) { ("▸ ", ACCENT) } else { ("  ", DIM) };
+        Span::styled(format!("{}{:<8}", mark, name), Style::default().fg(col))
+    };
+    let arrows = |fld: SearchField| {
+        if sel(fld) {
+            Span::styled("← →", Style::default().fg(DIM))
+        } else {
+            Span::raw("")
+        }
+    };
+
     // input line
     let mut input_spans = vec![
-        Span::styled("  string  ", Style::default().fg(DIM)),
+        field_label("string", SearchField::Pattern),
         Span::styled("›  ", Style::default().fg(DIM)),
     ];
     if app.pattern.is_empty() {
-        if focused {
+        if sel(SearchField::Pattern) {
             input_spans.push(Span::styled("█", Style::default().fg(ACCENT)));
         } else {
             input_spans.push(Span::styled(
@@ -153,7 +169,7 @@ fn draw_pattern_panel(f: &mut Frame, app: &App, area: Rect) {
             };
             input_spans.push(Span::styled(c.to_string(), style));
         }
-        if focused {
+        if sel(SearchField::Pattern) {
             input_spans.push(Span::styled("█", Style::default().fg(ACCENT)));
         }
     }
@@ -190,7 +206,7 @@ fn draw_pattern_panel(f: &mut Frame, app: &App, area: Rect) {
         let options = ["Prefix", "Suffix", "Anywhere"];
         let cur = app.match_type.label();
         let mut spans = vec![
-            Span::styled("  match   ", Style::default().fg(DIM)),
+            field_label("match", SearchField::Match),
             Span::styled("›  ", Style::default().fg(DIM)),
         ];
         for opt in options {
@@ -204,9 +220,7 @@ fn draw_pattern_panel(f: &mut Frame, app: &App, area: Rect) {
             }
             spans.push(Span::raw(" "));
         }
-        if focused {
-            spans.push(Span::styled("← →", Style::default().fg(DIM)));
-        }
+        spans.push(arrows(SearchField::Match));
         Line::from(spans)
     };
 
@@ -215,7 +229,7 @@ fn draw_pattern_panel(f: &mut Frame, app: &App, area: Rect) {
         let cur = app.backend;
         let gpu_available = app.gpu.is_some();
         let mut spans = vec![
-            Span::styled("  backend ", Style::default().fg(DIM)),
+            field_label("backend", SearchField::Backend),
             Span::styled("›  ", Style::default().fg(DIM)),
         ];
         for opt in options {
@@ -241,10 +255,39 @@ fn draw_pattern_panel(f: &mut Frame, app: &App, area: Rect) {
             (Backend::Gpu, None) => "unavailable".into(),
         };
         spans.push(Span::styled(detail, Style::default().fg(DIM)));
-        if focused {
-            spans.push(Span::styled("   ↑ ↓", Style::default().fg(DIM)));
-        }
+        spans.push(Span::raw("  "));
+        spans.push(arrows(SearchField::Backend));
         Line::from(spans)
+    };
+
+    // GPU BATCH_K picker: only meaningful on the GPU backend. Options are bounded
+    // by the device so the footprint can never exceed what the GPU can allocate.
+    let show_batch = app.backend == Backend::Gpu && app.gpu.is_some();
+    let batch_line = if show_batch {
+        let mut spans = vec![
+            field_label("batch", SearchField::Batch),
+            Span::styled("›  ", Style::default().fg(DIM)),
+        ];
+        for &k in &app.batch_k_options {
+            if k == app.batch_k {
+                spans.push(Span::styled(
+                    format!("[{}]", k),
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ));
+            } else {
+                spans.push(Span::styled(format!(" {} ", k), Style::default().fg(DIM)));
+            }
+            spans.push(Span::raw(" "));
+        }
+        let footprint = crate::gpu::est_footprint_bytes(app.batch_k);
+        spans.push(Span::styled(
+            format!("~{:.1} GB GPU  ", footprint as f64 / 1e9),
+            Style::default().fg(DIM),
+        ));
+        spans.push(arrows(SearchField::Batch));
+        Some(Line::from(spans))
+    } else {
+        None
     };
 
     let preview_line = if !app.pattern.is_empty() && valid {
@@ -282,15 +325,18 @@ fn draw_pattern_panel(f: &mut Frame, app: &App, area: Rect) {
         ))
     };
 
-    let text = Text::from(vec![
+    let mut lines = vec![
         Line::raw(""),
         Line::from(input_spans),
         validity_line,
         match_line,
         backend_line,
-        preview_line,
-    ]);
-    f.render_widget(Paragraph::new(text), inner);
+    ];
+    if let Some(batch_line) = batch_line {
+        lines.push(batch_line);
+    }
+    lines.push(preview_line);
+    f.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
 fn split_preview(
@@ -523,7 +569,10 @@ fn draw_status_panel(f: &mut Frame, app: &App, area: Rect) {
             worker,
             backend,
             ..
-        } => draw_benchmark_status(f, area, *started, worker.attempts(), *backend),
+        } => {
+            let steady = *worker.bench_rate.lock().unwrap();
+            draw_benchmark_status(f, area, *started, worker.attempts(), steady, *backend)
+        }
         Mode::Generating {
             started,
             worker,
@@ -617,6 +666,7 @@ fn draw_benchmark_status(
     area: Rect,
     started: std::time::Instant,
     attempts: u64,
+    steady_rate: Option<f64>,
     backend: Backend,
 ) {
     let title = match backend {
@@ -636,11 +686,14 @@ fn draw_benchmark_status(
     let elapsed = started.elapsed().as_secs_f64();
     let total = 5.0_f64;
     let progress = (elapsed / total).min(1.0);
-    let rate = if elapsed > 0.0 {
+    // Prefer the steady-state rate the bench publishes (excludes pipeline build +
+    // warm-up); fall back to the cold average only before the first productive
+    // dispatch reports. The cold average alone under-reads high-K GPU benches.
+    let rate = steady_rate.unwrap_or(if elapsed > 0.0 {
         attempts as f64 / elapsed
     } else {
         0.0
-    };
+    });
 
     let gauge_area = Rect {
         x: inner.x + 2,
@@ -985,7 +1038,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         Mode::Error(_) => "  [Esc] dismiss  │  [q] quit".to_string(),
         Mode::Idle => match &app.focused_panel {
             FocusedPanel::Pattern => {
-                "  type a–z 2–7  │  [← →] match  │  [↑ ↓] backend  │  [Tab] → actions  │  [q] quit"
+                "  [↑ ↓] select field  │  [← →] change  │  type a–z 2–7  │  [Tab] → actions  │  [q] quit"
                     .to_string()
             }
             FocusedPanel::Actions => {
@@ -999,4 +1052,53 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             .style(Style::default().bg(Color::Black)),
         area,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    fn render(app: &App) -> String {
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    /// The SEARCH panel must render the field rows without panicking (guards the
+    /// fixed panel height vs the number of rows, which grows with the batch row).
+    #[test]
+    fn search_panel_renders_fields() {
+        let app = App::new();
+        let text = render(&app);
+        assert!(text.contains("string"), "missing string field");
+        assert!(text.contains("match"), "missing match field");
+        assert!(text.contains("backend"), "missing backend field");
+        // Field-cursor marker is present on the focused panel's selected row.
+        assert!(text.contains('▸'), "missing field cursor marker");
+    }
+
+    /// The batch row appears only on the GPU backend, and renders with the cursor
+    /// there too (no overflow panic with all rows visible).
+    #[test]
+    fn batch_row_visible_only_on_gpu() {
+        let mut app = App::new();
+        if app.gpu.is_none() {
+            return; // no GPU in this environment; nothing to assert
+        }
+        // CPU backend: no batch row.
+        assert!(!render(&app).contains("batch"), "batch row shown on CPU");
+        // Switch to GPU and select the batch field.
+        app.backend = Backend::Gpu;
+        app.search_field = SearchField::Batch;
+        let text = render(&app);
+        assert!(text.contains("batch"), "batch row missing on GPU");
+    }
 }
